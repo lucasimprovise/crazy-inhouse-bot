@@ -14,25 +14,24 @@ LOGO_B64 = "/9j/4QBORXhpZgAATU0AKgAAAAgAAwEaAAUAAAABAAAAMgEbAAUAAAABAAAAOgEoAAMA
 
 QUEUES = {
     "radiant":   {"name": "Radiant / Immo3",  "emoji": "👑"},
-    "ascendant": {"name": "Ascendant / Plat", "emoji": "💎"},
+    "ascendant": {"name": "Ascendant / Immo", "emoji": "💎"},
     "gc":        {"name": "Game Changers",    "emoji": "🌸"},
 }
+# Seuils identiques à bot.py (elo < threshold)
 RANKS = [
-    (2200,"Radiant","#ff4655","🔴"),(2000,"Immortel 3","#ff6b6b","🟠"),
-    (1800,"Immortel 2","#ff8c42","🟠"),(1600,"Immortel 1","#ffa552","🟡"),
-    (1400,"Ascendant 3","#57c7a3","🟢"),(1250,"Ascendant 2","#4fb8a0","🟢"),
-    (1100,"Ascendant 1","#48a99c","🟢"),(1000,"Diamant 3","#4fc3f7","🔵"),
-    (900,"Diamant 2","#29b6f6","🔵"),(800,"Diamant 1","#0288d1","🔵"),
-    (700,"Platine 3","#26c6da","🩵"),(600,"Platine 2","#00bcd4","🩵"),
-    (500,"Platine 1","#00acc1","🩵"),(400,"Or 3","#ffd700","🟡"),
-    (300,"Or 2","#ffc107","🟡"),(200,"Or 1","#ffb300","🟡"),
-    (100,"Argent 3","#9e9e9e","⚪"),(0,"Argent 1","#757575","⚪"),
+    (900,  "Iron",     "#555555", "⬛"),
+    (1050, "Bronze",   "#ad6f3b", "🟫"),
+    (1200, "Silver",   "#c0c0c0", "⬜"),
+    (1350, "Gold",     "#ffd700", "🟨"),
+    (1500, "Platinum", "#00b4d8", "🟦"),
+    (1700, "Diamond",  "#9b5de5", "💎"),
 ]
 
 def get_rank(elo):
-    for t,n,c,i in RANKS:
-        if elo>=t: return n,c,i
-    return "Argent 1","#757575","⚪"
+    for threshold, name, color, icon in RANKS:
+        if elo < threshold:
+            return name, color, icon
+    return "Radiant", "#ff6b35", "👑"
 
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=5)
