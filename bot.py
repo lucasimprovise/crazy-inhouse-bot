@@ -927,6 +927,10 @@ async def ping_queue_watchers(guild: discord.Guild, joiner_uid: str, joiner_name
     queue_players = [p["id"] for p in queues[queue_id]]
     required_role_name = QUEUE_ROLES.get(queue_id)
     required_role = discord.utils.get(guild.roles, name=required_role_name) if required_role_name else None
+    # Si le rôle requis n'existe pas sur le serveur, on ne ping personne pour éviter le spam
+    if required_role_name and not required_role:
+        print(f"⚠️ Rôle '{required_role_name}' introuvable — ping annulé pour queue {queue_id}")
+        return
 
     for row in rows:
         uid = row["discord_id"]
@@ -3386,6 +3390,24 @@ async def syncnotifs_cmd(interaction: discord.Interaction):
         f"✅ Bouton ajouté : **{ok}** salons\n⏭️ Déjà présent : **{skip}** salons\n❌ Erreur : **{fail}** salons",
         ephemeral=True
     )
+
+
+@tree.command(name="debugroles", description="[ADMIN] Voir les noms exacts des rôles du serveur")
+async def debugroles_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    roles = [r.name for r in interaction.guild.roles if "queue" in r.name.lower() or "gc" in r.name.lower() or "radiant" in r.name.lower() or "ascendant" in r.name.lower() or "game" in r.name.lower()]
+    mapped = {k: v for k, v in QUEUE_ROLES.items()}
+    found = {}
+    for qid, rname in QUEUE_ROLES.items():
+        role = discord.utils.get(interaction.guild.roles, name=rname)
+        found[qid] = f"✅ `{rname}`" if role else f"❌ `{rname}` INTROUVABLE"
+    txt = "**Rôles liés aux queues sur ce serveur :**\n"
+    txt += "\n".join(f"• `{r}`" for r in roles) or "*(aucun trouvé)*"
+    txt += "\n\n**Mapping actuel dans le bot :**\n"
+    txt += "\n".join(f"• {qid} → {status}" for qid, status in found.items())
+    await interaction.response.send_message(txt, ephemeral=True)
 
 
 @tree.command(name="dbstats", description="[ADMIN] Voir l'état de la base de données")
