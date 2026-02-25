@@ -96,6 +96,7 @@ def get_player_queue_id(uid: str) -> str | None:
 #  DATABASE
 # ─────────────────────────────────────────────
 def restore_db_if_needed():
+
     """Restaure la DB depuis DB_SEED (base64) si le fichier n'existe pas encore."""
     db_path = os.getenv("DB_PATH", "inhouse.db")
     db_seed = os.getenv("DB_SEED", "")
@@ -107,6 +108,11 @@ def restore_db_if_needed():
         print(f"✅ DB restaurée depuis DB_SEED → {db_path}")
 
 restore_db_if_needed()
+
+# Démarrer le serveur web en parallèle du bot
+from web import start_web_server
+start_web_server()
+
 
 def get_db():
     db_path = os.getenv("DB_PATH", "inhouse.db")
@@ -3209,6 +3215,41 @@ async def test_veto_cmd(interaction: discord.Interaction):
 
     view = MapVetoView(test_match_id, VALORANT_MAPS, fake_cap, fake_cap, on_veto_done)
     await interaction.response.send_message(embed=veto_embed, view=view)
+
+
+@tree.command(name="dbstats", description="[ADMIN] Voir l'état de la base de données")
+async def dbstats_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+
+    import os
+    conn = get_db()
+    db_path = os.getenv("DB_PATH", "inhouse.db")
+
+    players      = conn.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+    members      = conn.execute("SELECT COUNT(*) FROM player_channels").fetchone()[0]
+    matches_done = conn.execute("SELECT COUNT(*) FROM matches WHERE status='completed'").fetchone()[0]
+    matches_act  = conn.execute("SELECT COUNT(*) FROM matches WHERE status='active'").fetchone()[0]
+    applications = conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0]
+    apps_pending = conn.execute("SELECT COUNT(*) FROM applications WHERE status='pending'").fetchone()[0]
+    db_size      = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+    conn.close()
+
+    embed = discord.Embed(
+        title="🗄️ État de la Base de Données",
+        color=0x57f287,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="📁 Fichier", value=f"`{db_path}`\n**{db_size/1024:.1f} KB**", inline=False)
+    embed.add_field(name="👥 Joueurs inscrits", value=f"**{players}**", inline=True)
+    embed.add_field(name="🏠 Espaces privés", value=f"**{members}**", inline=True)
+    embed.add_field(name="📋 Candidatures", value=f"**{applications}** total\n**{apps_pending}** en attente", inline=True)
+    embed.add_field(name="⚔️ Matchs terminés", value=f"**{matches_done}**", inline=True)
+    embed.add_field(name="🔴 Matchs en cours", value=f"**{matches_act}**", inline=True)
+    embed.add_field(name="💾 Volume", value="✅ Monté" if db_path.startswith("/data") else "⚠️ Local (pas de volume)", inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="clearfake", description="[ADMIN] Supprimer les joueurs fictifs de la DB")

@@ -1,96 +1,115 @@
-# 🎮 Valorant In-House Bot
+# 🎮 Crazy Inhouse — Bot Discord Valorant
 
-Bot Discord complet pour gérer des in-house Valorant avec système ELO, queue équilibrée et résultats par boutons.
+Bot Discord complet pour gérer un serveur inhouse Valorant avec système ELO, queues multiples, espaces privés, map veto et site web public.
 
 ---
 
 ## ✅ Fonctionnalités
 
-- **Queue 10 joueurs** avec boutons Join/Leave
-- **Équilibrage par ELO** (minimise l'écart entre les deux équipes)
-- **Channels vocaux** créés automatiquement à chaque match
-- **Vote résultat** par boutons Discord (6/10 votes pour valider)
-- **Système ELO** (K=32, algorithme Elo standard)
-- **Leaderboard auto** mis à jour après chaque match
-- **Historique des matchs**
-- **Commandes admin** : forcer résultat, annuler match, modifier ELO
+### Système de queues
+- **3 queues indépendantes** : Radiant/Immo3, Ascendant/Plat, Game Changers
+- **Équilibrage optimal** par ELO (teste toutes les combinaisons possibles parmi les 252 splits de 5v5)
+- **Rôles sélectionnables** : Duelliste, Initiateur, Contrôleur, Sentinelle, Flex
+- **Cooldown progressif** en cas de leaves répétés (0 → 1 → 3 → 10 → 20 min)
 
-### Paliers de rang
-| Rang      | ELO       |
-|-----------|-----------|
-| ⬛ Iron   | < 900     |
-| 🟫 Bronze | 900–1049  |
-| ⬜ Silver | 1050–1199 |
-| 🟨 Gold   | 1200–1349 |
-| 🟦 Platinum | 1350–1499 |
-| 💎 Diamond | 1500–1699 |
-| 👑 Radiant | 1700+    |
+### Espaces privés joueurs
+- Catégorie privée créée automatiquement à la validation de la candidature
+- 4 salons : `🎮 queue`, `📊 profil`, `🔔 notifications`, `📜 historique`
+- Statut mis à jour en temps réel (en queue / match en cours / disponible)
+
+### Système de matchs
+- **Création automatique** de catégorie + vocaux + scoreboard à chaque match
+- **Map veto interactif** : les capitaines (ELO le plus élevé) bannissent à tour de rôle
+- **Lobby code** partageable par le capitaine via `/lobbycode`
+- **Score personnalisé** avec multiplicateur selon la dominance (13-0 vs 13-12)
+- Calcul ELO par queue + ELO global
+
+### Système ELO & Rangs
+| Rang | ELO |
+|------|-----|
+| ⚪ Argent | < 500 |
+| 🟡 Or | 500–799 |
+| 🔵 Platine | 800–999 |
+| 🩵 Diamant | 1000–1299 |
+| 🟢 Ascendant | 1300–1599 |
+| 🟠 Immortel | 1600–1999 |
+| 🔴 Radiant | 2000+ |
+
+- **Matchs de placement** (10 matchs avant d'être classé)
+- **Facteur K** variable selon l'expérience
+- **Streaks** de victoires suivis et affichés
+
+### Candidatures
+- Formulaire complet (Riot ID, rang, âge, présentation)
+- Interface staff pour accepter/refuser avec message personnalisé
+- Création automatique de l'espace privé à l'acceptation
+
+### Site web public
+- **`/`** — Accueil avec stats globales, top 3, derniers matchs
+- **`/leaderboard`** — Classement global et par queue
+- **`/matches`** — Historique des 50 derniers matchs
+- **`/player/<discord_id>`** — Profil détaillé d'un joueur
 
 ---
 
-## 🚀 Installation
+## 🚀 Installation locale
 
 ### 1. Prérequis
-- Python 3.10+
+- Python 3.11+
 - Un compte Discord Developer
 
 ### 2. Créer le bot Discord
 
 1. Va sur https://discord.com/developers/applications
-2. Clique **New Application** → donne un nom
+2. **New Application** → donne un nom
 3. Va dans **Bot** → **Add Bot**
 4. Active ces **Privileged Gateway Intents** :
    - ✅ Server Members Intent
    - ✅ Message Content Intent
-5. Copie le **Token** (garde-le secret !)
+5. Copie le **Token**
 6. Va dans **OAuth2 → URL Generator** :
    - Scopes : `bot` + `applications.commands`
-   - Bot Permissions : `Administrator` (ou personnalisé : Manage Channels, Send Messages, Read Messages, Connect, Manage Roles)
-7. Copie l'URL générée et invite le bot sur ton serveur
+   - Permissions : `Administrator`
+7. Invite le bot sur ton serveur
 
-### 3. Configurer le bot
+### 3. Configurer et lancer
 
 ```bash
-# Clone / télécharge le projet
-cd valorant-inhouse-bot
-
-# Installe les dépendances
 pip install -r requirements.txt
-
-# Crée ton fichier .env
 cp .env.example .env
-```
-
-Ouvre `.env` et remplis :
-```
-DISCORD_TOKEN=ton_token_ici
-GUILD_ID=l_id_de_ton_serveur
-```
-
-> **Comment trouver ton Guild ID ?**  
-> Active le mode développeur dans Discord (Paramètres → Avancé → Mode développeur),  
-> puis fais clic droit sur ton serveur → **Copier l'identifiant**
-
-### 4. Créer les channels nécessaires
-
-Sur ton serveur Discord, crée :
-- Un channel texte nommé **`queue`** (pour afficher la file)
-- Un channel texte nommé **`leaderboard`** (mis à jour automatiquement)
-- Un channel texte nommé **`match-results`** ou utilise n'importe quel channel
-
-### 5. Lancer le bot
-
-```bash
+# Remplis DISCORD_TOKEN et GUILD_ID dans .env
 python bot.py
 ```
 
-### 6. Initialiser la queue
+---
 
-Dans le channel `#queue`, tape :
+## ☁️ Déploiement Railway
+
+### 1. GitHub
+```bash
+git init
+git add .
+git commit -m "Initial commit"
+git remote add origin https://github.com/TON_USERNAME/crazy-inhouse-bot.git
+git push -u origin main
 ```
-/queue
+
+### 2. Railway
+1. Va sur https://railway.app → **New Project** → **Deploy from GitHub**
+2. Sélectionne ton repo
+3. Onglet **Variables** → ajoute :
+   - `DISCORD_TOKEN` — ton token bot
+   - `GUILD_ID` — l'ID de ton serveur
+4. Ajoute un **Volume** monté sur `/data` → ajoute `DB_PATH=/data/inhouse.db`
+5. **Settings → Networking → Generate Domain** pour le site web public
+
+### 3. Mises à jour futures
+```bash
+git add .
+git commit -m "description"
+git push
 ```
-Le bot va afficher le panneau avec les boutons Join/Leave. **C'est le seul message que tu dois créer manuellement.**
+Railway redéploie automatiquement.
 
 ---
 
@@ -99,56 +118,66 @@ Le bot va afficher le panneau avec les boutons Join/Leave. **C'est le seul messa
 ### Joueurs
 | Commande | Description |
 |----------|-------------|
-| `/register` | S'inscrire (1000 ELO de base) |
-| `/rank` | Voir ses stats |
-| `/rank @user` | Voir les stats d'un autre joueur |
-| `/leaderboard` | Top 10 joueurs |
-| `/history` | Derniers matchs (défaut: 5) |
+| `/register` | S'inscrire / mettre à jour son Riot ID |
+| `/rank` | Voir ses stats et ELO |
+| `/history` | Historique de ses matchs |
 
-### Admin
+### Candidatures
 | Commande | Description |
 |----------|-------------|
-| `/queue` | Afficher le panneau queue (à faire 1 fois) |
-| `/clearqueue` | Vider la queue |
-| `/setelo @user 1200` | Modifier l'ELO d'un joueur |
-| `/resetplayer @user` | Remettre un joueur à 1000 ELO |
+| `/apply` | Soumettre une candidature |
 
-### Boutons en jeu
-- **🏆 Team 1/2 a gagné** — Vote pour le résultat (6/10 pour valider)
-- **⚙️ Forcer Team 1/2** — Admin force le résultat
-- **🚫 Annuler le match** — Admin annule sans modifier les ELO
+### Admin — Serveur
+| Commande | Description |
+|----------|-------------|
+| `/initserver` | Créer tous les salons et catégories |
+| `/fillchannels` | Mettre à jour le contenu des salons info |
+| `/setupspaces` | Créer les espaces privés (membres validés uniquement) |
+
+### Admin — Queue & Matchs
+| Commande | Description |
+|----------|-------------|
+| `/setqueue` | Afficher le panneau queue dans le salon courant |
+| `/clearqueue` | Vider toutes les queues |
+| `/fillqueue` | Remplir la queue avec des joueurs fictifs (tests) |
+| `/clearfake` | Supprimer les joueurs fictifs de la DB |
+| `/setelo @user 1200` | Modifier l'ELO d'un joueur |
+| `/setqueueelo @user queue 1200` | Modifier l'ELO par queue |
+| `/resetplayer @user` | Remettre à 1000 ELO |
+| `/forcefinish` | Forcer la fin d'un match |
+| `/lobbycode CODE` | Partager le code lobby (capitaines uniquement) |
+
+### Admin — Tests & Debug
+| Commande | Description |
+|----------|-------------|
+| `/testmode` | Activer le mode test (queue réduite) |
+| `/testveto` | Tester le système de veto seul |
+| `/dbstats` | Voir l'état de la base de données |
 
 ---
 
-## 🔧 Hébergement 24/7
+## 📁 Structure du projet
 
-### Option A — Railway (gratuit jusqu'à 5$/mois de crédit)
-1. Va sur https://railway.app
-2. New Project → Deploy from GitHub (upload tes fichiers)
-3. Ajoute les variables d'environnement dans Settings
-4. C'est tout !
-
-### Option B — VPS (Contabo, OVH, DigitalOcean)
-```bash
-# Installer screen pour garder le bot actif
-sudo apt install screen
-screen -S inhouse-bot
-python bot.py
-# Ctrl+A puis D pour détacher
 ```
-
-### Option C — Raspberry Pi
-Même méthode que VPS.
+valorant-inhouse-bot/
+├── bot.py          # Bot Discord principal (~3300 lignes)
+├── web.py          # Serveur web Flask public
+├── requirements.txt
+├── Procfile        # Démarrage Railway
+├── runtime.txt     # Version Python
+├── .env.example    # Template variables d'environnement
+└── .gitignore
+```
 
 ---
 
 ## ❓ FAQ
 
-**Q: Les commandes n'apparaissent pas ?**  
-R: Les slash commands peuvent prendre jusqu'à 1 heure à se propager. Si `GUILD_ID` est bien configuré, elles apparaissent en quelques secondes.
+**Les commandes n'apparaissent pas ?**
+Les slash commands peuvent prendre jusqu'à 1h. Avec `GUILD_ID` configuré, elles apparaissent en quelques secondes.
 
-**Q: Le bot plante après un redémarrage et perd les matchs actifs ?**  
-R: Les matchs actifs sont en mémoire RAM. Si le bot redémarre pendant un match, un admin devra utiliser `/clearqueue` et recréer le match. Pour une solution persistante, il faudrait sauvegarder `active_matches` en DB.
+**La DB est perdue après un redémarrage ?**
+Assure-toi d'avoir un Volume Railway monté sur `/data` et la variable `DB_PATH=/data/inhouse.db`. Vérifie avec `/dbstats` que le chemin commence par `/data`.
 
-**Q: Comment changer la taille de la queue (ex: 6v6) ?**  
-R: Change `QUEUE_SIZE = 10` en haut de `bot.py` et adapte le seuil de vote (actuellement 6/10).
+**Un match est bloqué après un redémarrage ?**
+Les matchs actifs sont en mémoire. Utilise `/forcefinish` s'il est encore en cours, sinon nettoie manuellement la catégorie Discord et la DB.
