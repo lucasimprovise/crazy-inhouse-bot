@@ -95,6 +95,19 @@ def get_player_queue_id(uid: str) -> str | None:
 # ─────────────────────────────────────────────
 #  DATABASE
 # ─────────────────────────────────────────────
+def restore_db_if_needed():
+    """Restaure la DB depuis DB_SEED (base64) si le fichier n'existe pas encore."""
+    db_path = os.getenv("DB_PATH", "inhouse.db")
+    db_seed = os.getenv("DB_SEED", "")
+    if db_seed and not os.path.exists(db_path):
+        import base64
+        os.makedirs(os.path.dirname(db_path), exist_ok=True) if os.path.dirname(db_path) else None
+        with open(db_path, "wb") as f:
+            f.write(base64.b64decode(db_seed))
+        print(f"✅ DB restaurée depuis DB_SEED → {db_path}")
+
+restore_db_if_needed()
+
 def get_db():
     db_path = os.getenv("DB_PATH", "inhouse.db")
     conn = sqlite3.connect(db_path, timeout=10)
@@ -659,7 +672,7 @@ async def create_player_space(guild: discord.Guild, member: discord.Member):
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        member: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True, create_public_threads=False, create_private_threads=False, send_messages_in_threads=False, use_application_commands=True),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
     }
     # Staff/Coach voient aussi
@@ -670,7 +683,10 @@ async def create_player_space(guild: discord.Guild, member: discord.Member):
     try:
         cat = await guild.create_category(f"👤 {member.display_name}", overwrites=overwrites)
         ch_queue   = await guild.create_text_channel("🎮︱queue",       category=cat, overwrites=overwrites)
-        ch_profil  = await guild.create_text_channel("📊︱profil",      category=cat, overwrites=overwrites)
+        # Profil : send_messages activé pour que /register fonctionne
+        overwrites_profil = dict(overwrites)
+        overwrites_profil[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, create_public_threads=False, create_private_threads=False, use_application_commands=True)
+        ch_profil  = await guild.create_text_channel("📊︱profil",      category=cat, overwrites=overwrites_profil)
         ch_notifs  = await guild.create_text_channel("🔔︱notifications", category=cat, overwrites=overwrites)
         ch_history = await guild.create_text_channel("📜︱historique",  category=cat, overwrites=overwrites)
 
@@ -2860,9 +2876,19 @@ async def setup_spaces_cmd(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
+    membre_role = discord.utils.get(guild.roles, name="Membre")
+    if not membre_role:
+        await interaction.followup.send("❌ Rôle **Membre** introuvable sur ce serveur.", ephemeral=True)
+        return
+
     count = 0
+    skipped = 0
     for member in guild.members:
         if member.bot:
+            continue
+        # Seulement les membres avec le rôle "Membre" (candidatures validées)
+        if membre_role not in member.roles:
+            skipped += 1
             continue
         conn = get_db()
         existing = conn.execute("SELECT discord_id FROM player_channels WHERE discord_id=?", (str(member.id),)).fetchone()
@@ -2871,7 +2897,10 @@ async def setup_spaces_cmd(interaction: discord.Interaction):
             await create_player_space(guild, member)
             count += 1
             await asyncio.sleep(0.5)  # Éviter le rate limit Discord
-    await interaction.followup.send(f"✅ **{count}** espace(s) privé(s) créé(s) !", ephemeral=True)
+    await interaction.followup.send(
+        f"✅ **{count}** espace(s) créé(s).\n⏭️ **{skipped}** membre(s) ignoré(s) (pas encore validés).",
+        ephemeral=True
+    )
 
 
 @tree.command(name="addcoach", description="[ADMIN] Attribuer le rôle Coach à un membre")
