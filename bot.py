@@ -216,6 +216,7 @@ def init_db():
         "ALTER TABLE matches ADD COLUMN map TEXT",
         "ALTER TABLE matches ADD COLUMN mvp TEXT",
         "ALTER TABLE matches ADD COLUMN season INTEGER DEFAULT 1",
+        "ALTER TABLE player_channels ADD COLUMN notif_enabled INTEGER DEFAULT 1",
     ]
     # Create extra tables if missing
     for tbl_sql in [
@@ -750,6 +751,36 @@ async def _init_queue_channel(channel: discord.TextChannel, member: discord.Memb
     conn_save.close()
 
 
+class NotifToggleView(discord.ui.View):
+    """Bouton persistant pour activer/désactiver les alertes queue."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔔 Alertes queue : ON", style=discord.ButtonStyle.success, custom_id="notif_toggle")
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = str(interaction.user.id)
+        conn = get_db()
+        row = conn.execute("SELECT notif_enabled FROM player_channels WHERE discord_id=?", (uid,)).fetchone()
+        if not row:
+            conn.close()
+            await interaction.response.send_message("❌ Espace non trouvé.", ephemeral=True)
+            return
+        new_val = 0 if row["notif_enabled"] else 1
+        conn.execute("UPDATE player_channels SET notif_enabled=? WHERE discord_id=?", (new_val, uid))
+        conn.commit()
+        conn.close()
+        if new_val:
+            button.label = "🔔 Alertes queue : ON"
+            button.style = discord.ButtonStyle.success
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send("✅ Tu seras pингué quand quelqu'un rejoint une queue.", ephemeral=True)
+        else:
+            button.label = "🔕 Alertes queue : OFF"
+            button.style = discord.ButtonStyle.secondary
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send("🔕 Tu ne recevras plus d'alertes queue.", ephemeral=True)
+
+
 async def _init_profil_channel(channel: discord.TextChannel, member: discord.Member, guild: discord.Guild):
     """Poste l'embed de profil initial."""
     uid = str(member.id)
@@ -783,6 +814,21 @@ async def _init_profil_channel(channel: discord.TextChannel, member: discord.Mem
             embed.add_field(name="Compte Riot", value=f"`{row['riot_id']}`", inline=True)
     embed.set_footer(text="Mis à jour automatiquement après chaque match.")
     await channel.send(embed=embed)
+
+    # Bouton toggle notifications
+    conn2 = get_db()
+    notif_row = conn2.execute("SELECT notif_enabled FROM player_channels WHERE discord_id=?", (uid,)).fetchone()
+    conn2.close()
+    enabled = notif_row["notif_enabled"] if notif_row and notif_row["notif_enabled"] is not None else 1
+    view = NotifToggleView()
+    view.children[0].label = "🔔 Alertes queue : ON" if enabled else "🔕 Alertes queue : OFF"
+    view.children[0].style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
+    notif_embed = discord.Embed(
+        title="🔔 Alertes Queue",
+        description="Reçois une mention dans ce salon dès que quelqu'un rejoint une queue.",
+        color=0x6553e8
+    )
+    await channel.send(embed=notif_embed, view=view)
 
 
 async def update_player_profil(guild: discord.Guild, uid: str):
@@ -859,6 +905,54 @@ async def update_player_history(guild: discord.Guild, uid: str, match_id: str, w
         embed.add_field(name="ELO", value=f"{old_elo} ➜ **{new_elo}** (`{change}`) {ricon}", inline=True)
     embed.add_field(name="Match", value=f"`{match_id[-6:]}`", inline=True)
     await channel.send(embed=embed)
+
+
+# Rôles Discord requis par queue
+QUEUE_ROLES = {
+    "radiant":   "Queue Radiant",
+    "ascendant": "Queue Ascendant",
+    "gc":        "Queue GC",
+}
+
+async def ping_queue_watchers(guild: discord.Guild, joiner_uid: str, joiner_name: str, queue_id: str, nb: int, size: int):
+    """Mentionne dans leur salon notifs les joueurs qui ont activé les alertes queue
+    et qui ont le rôle Discord correspondant à cette queue."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT discord_id, notifs_channel, notif_enabled FROM player_channels WHERE notif_enabled = 1"
+    ).fetchall()
+    conn.close()
+
+    q_info = QUEUES[queue_id]
+    queue_players = [p["id"] for p in queues[queue_id]]
+    required_role_name = QUEUE_ROLES.get(queue_id)
+    required_role = discord.utils.get(guild.roles, name=required_role_name) if required_role_name else None
+
+    for row in rows:
+        uid = row["discord_id"]
+        # Pas de ping pour celui qui vient de rejoindre, ni pour ceux déjà en queue
+        if uid == joiner_uid or uid in queue_players:
+            continue
+        member = guild.get_member(int(uid))
+        if not member:
+            continue
+        # Vérifie que le membre a le rôle requis pour cette queue
+        if required_role and required_role not in member.roles:
+            continue
+        notif_ch = guild.get_channel(row["notifs_channel"])
+        if not notif_ch:
+            continue
+        desc = f"**{joiner_name}** vient de rejoindre la queue.\n**{nb}/{size}** joueurs présents."
+        embed = discord.Embed(
+            title=f"🔔 Queue active — {q_info['name']}",
+            description=desc,
+            color=0x6553e8
+        )
+        embed.set_footer(text="Rejoins via ton salon 🎮︱queue · Désactive avec /notifications")
+        try:
+            await notif_ch.send(content=member.mention, embed=embed)
+        except Exception:
+            pass
 
 
 async def notify_player(guild: discord.Guild, uid: str, embed: discord.Embed):
@@ -1185,6 +1279,10 @@ async def _join_queue(interaction: discord.Interaction, uid: str, username: str,
         ephemeral=True
     )
     await update_personal_queue_embeds(interaction.guild)
+
+    # Ping les joueurs qui ont les notifs activées (sauf celui qui vient de rejoindre)
+    await ping_queue_watchers(interaction.guild, uid, username, queue_id, nb, current_size)
+
     if nb >= current_size:
         await start_match(interaction, queue_id=queue_id)
 
@@ -3217,6 +3315,79 @@ async def test_veto_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=veto_embed, view=view)
 
 
+@tree.command(name="notifications", description="Activer ou désactiver les alertes quand une queue se lance")
+async def notifications_cmd(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    conn = get_db()
+    row = conn.execute("SELECT notif_enabled, notifs_channel FROM player_channels WHERE discord_id=?", (uid,)).fetchone()
+    conn.close()
+    if not row:
+        await interaction.response.send_message("❌ Tu n'as pas encore d'espace privé.", ephemeral=True)
+        return
+    new_val = 0 if row["notif_enabled"] else 1
+    conn2 = get_db()
+    conn2.execute("UPDATE player_channels SET notif_enabled=? WHERE discord_id=?", (new_val, uid))
+    conn2.commit()
+    conn2.close()
+    status = "🔔 **activées**" if new_val else "🔕 **désactivées**"
+    await interaction.response.send_message(
+        f"Alertes queue {status}. Tu peux aussi changer ça depuis ton salon 📊︱profil.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="syncnotifs", description="[ADMIN] Ajoute le bouton de notifs dans tous les salons profil existants")
+async def syncnotifs_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    conn = get_db()
+    rows = conn.execute("SELECT discord_id, profil_channel, notif_enabled FROM player_channels").fetchall()
+    conn.close()
+
+    ok, skip, fail = 0, 0, 0
+    for row in rows:
+        uid = row["discord_id"]
+        channel = guild.get_channel(row["profil_channel"])
+        if not channel:
+            fail += 1
+            continue
+
+        # Vérifie si le bouton existe déjà
+        has_button = False
+        async for msg in channel.history(limit=20):
+            if msg.author == guild.me and msg.components:
+                has_button = True
+                break
+
+        if has_button:
+            skip += 1
+            continue
+
+        enabled = row["notif_enabled"] if row["notif_enabled"] is not None else 1
+        view = NotifToggleView()
+        view.children[0].label = "🔔 Alertes queue : ON" if enabled else "🔕 Alertes queue : OFF"
+        view.children[0].style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
+        notif_embed = discord.Embed(
+            title="🔔 Alertes Queue",
+            description="Reçois une mention dans ce salon dès que quelqu\'un rejoint une queue.",
+            color=0x6553e8
+        )
+        try:
+            await channel.send(embed=notif_embed, view=view)
+            ok += 1
+        except Exception:
+            fail += 1
+
+    await interaction.followup.send(
+        f"✅ Bouton ajouté : **{ok}** salons\n⏭️ Déjà présent : **{skip}** salons\n❌ Erreur : **{fail}** salons",
+        ephemeral=True
+    )
+
+
 @tree.command(name="dbstats", description="[ADMIN] Voir l'état de la base de données")
 async def dbstats_cmd(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -3412,6 +3583,7 @@ async def on_ready():
     # Vues statiques persistantes
     bot.add_view(ApplicationButtonView())
     bot.add_view(QueueView())
+    bot.add_view(NotifToggleView())
 
     # Réenregistrer les PersonalQueueView de chaque joueur (custom_id dynamique)
     conn = get_db()
