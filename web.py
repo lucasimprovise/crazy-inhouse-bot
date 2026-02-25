@@ -340,7 +340,7 @@ def index():
     <div class="section-title" style="margin-top:0">Les queues</div>
     <div class="queues" style="margin-bottom:3rem">
       <div class="queue-card"><div class="queue-emoji">👑</div><div class="queue-name">Radiant / Immo3</div><div class="queue-desc">Pour les joueurs au niveau le plus élevé. Parties ultra-compétitives avec les meilleurs du serveur.</div><span class="queue-badge">TOP LEVEL</span></div>
-      <div class="queue-card"><div class="queue-emoji">💎</div><div class="queue-name">Ascendant / Plat</div><div class="queue-desc">La queue principale. Ouverte aux joueurs de niveau intermédiaire à avancé cherchant à progresser sérieusement.</div><span class="queue-badge">QUEUE PRINCIPALE</span></div>
+      <div class="queue-card"><div class="queue-emoji">💎</div><div class="queue-name">Ascendant / Immo</div><div class="queue-desc">La queue principale. Ouverte aux joueurs de niveau intermédiaire à avancé cherchant à progresser sérieusement.</div><span class="queue-badge">QUEUE PRINCIPALE</span></div>
       <div class="queue-card"><div class="queue-emoji">🌸</div><div class="queue-name">Game Changers</div><div class="queue-desc">Queue dédiée aux joueuses. Même format compétitif, même niveau d'exigence, dans un cadre respectueux.</div><span class="queue-badge">GAME CHANGERS</span></div>
     </div>
 
