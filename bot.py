@@ -909,9 +909,9 @@ async def update_player_history(guild: discord.Guild, uid: str, match_id: str, w
 
 # Rôles Discord requis par queue
 QUEUE_ROLES = {
-    "radiant":   "Queue Radiant",
-    "ascendant": "Queue Ascendant",
-    "gc":        "Queue GC",
+    "radiant":      "Queue Radiant",
+    "ascendant":    "Queue Ascendant",
+    "gamechangers": "Queue GC",
 }
 
 async def ping_queue_watchers(guild: discord.Guild, joiner_uid: str, joiner_name: str, queue_id: str, nb: int, size: int):
@@ -927,21 +927,21 @@ async def ping_queue_watchers(guild: discord.Guild, joiner_uid: str, joiner_name
     queue_players = [p["id"] for p in queues[queue_id]]
     required_role_name = QUEUE_ROLES.get(queue_id)
     required_role = discord.utils.get(guild.roles, name=required_role_name) if required_role_name else None
-    # Si le rôle requis n'existe pas sur le serveur, on ne ping personne pour éviter le spam
+    print(f"[PING DEBUG] queue={queue_id} role_name='{required_role_name}' role_found={required_role is not None}")
     if required_role_name and not required_role:
-        print(f"⚠️ Rôle '{required_role_name}' introuvable — ping annulé pour queue {queue_id}")
+        print(f"[PING DEBUG] Rôle introuvable, ping annulé")
         return
 
     for row in rows:
         uid = row["discord_id"]
-        # Pas de ping pour celui qui vient de rejoindre, ni pour ceux déjà en queue
         if uid == joiner_uid or uid in queue_players:
             continue
         member = guild.get_member(int(uid))
         if not member:
             continue
-        # Vérifie que le membre a le rôle requis pour cette queue
-        if required_role and required_role not in member.roles:
+        has_role = required_role in member.roles if required_role else False
+        print(f"[PING DEBUG] membre={member.display_name} has_role={has_role}")
+        if not has_role:
             continue
         notif_ch = guild.get_channel(row["notifs_channel"])
         if not notif_ch:
