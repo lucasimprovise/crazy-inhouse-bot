@@ -2175,7 +2175,8 @@ async def rank_cmd(interaction: discord.Interaction, user: discord.Member = None
     conn.close()
 
     if not row:
-        await interaction.response.send_message(f"❌ {'Tu n\'es pas inscrit' if not user else f'{target.display_name} n\'est pas inscrit'}. Utilise `/register` !", ephemeral=True)
+        not_registered = "Tu n'es pas inscrit" if not user else f"{target.display_name} n'est pas inscrit"
+        await interaction.response.send_message(f"❌ {not_registered}. Utilise `/register` !", ephemeral=True)
         return
 
     rname, ricon, color = get_rank(row["elo"])
