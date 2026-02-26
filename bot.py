@@ -41,10 +41,11 @@ QUEUES = {
     "radiant": {
         "id":          "radiant",
         "name":        "👑 Radiant / Immo3",
-        "role":        "Queue Radiant",      # Rôle Discord requis
+        "role":        "Queue Radiant",
         "color":       0xffd700,
         "emoji":       "👑",
-        "channel":     "queue-radiant",      # Nom du channel staff global
+        "channel":     "queue-radiant",
+        "chat":        "radiant-chat",
     },
     "ascendant": {
         "id":          "ascendant",
@@ -53,6 +54,7 @@ QUEUES = {
         "color":       0x9b59b6,
         "emoji":       "💎",
         "channel":     "queue-ascendant-immo",
+        "chat":        "ascendant-chat",
     },
     "gamechangers": {
         "id":          "gamechangers",
@@ -61,8 +63,14 @@ QUEUES = {
         "color":       0xff69b4,
         "emoji":       "🌸",
         "channel":     "queue-gamechangers",
+        "chat":        "gc-chat",
     },
 }
+
+# État des pings par queue — anti-spam
+# first_at/mid_at = datetime du dernier ping, None si pas encore envoyé
+PING_COOLDOWN_MINUTES = 10  # délai minimum entre deux sessions de ping
+queue_ping_state: dict = {qid: {"first_at": None, "mid": False} for qid in ["radiant", "ascendant", "gamechangers"]}
 
 VALORANT_MAPS = [
     "Abyss", "Ascent", "Bind", "Breeze", "Fracture",
@@ -704,13 +712,23 @@ async def create_player_space(guild: discord.Guild, member: discord.Member):
 
 def get_queue_channel(guild: discord.Guild, queue_id: str):
     """Retourne le salon queue partagé pour une queue donnée."""
-    ch_name = QUEUES[queue_id]["channel"]  # ex: "queue-radiant"
+    ch_name = QUEUES[queue_id]["channel"]
     for cat in guild.categories:
         if "QUEUES" in cat.name.upper():
             for ch in cat.channels:
                 if ch.name == ch_name:
                     return ch
-    # Fallback global
+    return discord.utils.get(guild.text_channels, name=ch_name)
+
+
+def get_queue_chat_channel(guild: discord.Guild, queue_id: str):
+    """Retourne le salon chat d'une queue."""
+    ch_name = QUEUES[queue_id]["chat"]
+    for cat in guild.categories:
+        if "QUEUES" in cat.name.upper():
+            for ch in cat.channels:
+                if ch.name == ch_name:
+                    return ch
     return discord.utils.get(guild.text_channels, name=ch_name)
 
 
@@ -901,45 +919,52 @@ QUEUE_ROLES = {
 }
 
 async def ping_queue_watchers(guild: discord.Guild, joiner_uid: str, joiner_name: str, queue_id: str, nb: int, size: int):
-    """Mentionne dans leur salon notifs les joueurs qui ont activé les alertes queue
-    et qui ont le rôle Discord correspondant à cette queue."""
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT discord_id, notif_enabled FROM player_channels WHERE notif_enabled = 1"
-    ).fetchall()
-    conn.close()
-
+    """Ping dans le salon chat de la queue — une fois au 1er joueur, une fois à mi-chemin.
+    Anti-spam : ignore si le ping de session a déjà été envoyé."""
+    global queue_ping_state
     q_info = QUEUES[queue_id]
-    queue_players = [p["id"] for p in queues[queue_id]]
-    required_role_name = QUEUE_ROLES.get(queue_id)
-    required_role = discord.utils.get(guild.roles, name=required_role_name) if required_role_name else None
-    print(f"[PING DEBUG] queue={queue_id} role_name='{required_role_name}' role_found={required_role is not None}")
-    if required_role_name and not required_role:
-        print(f"[PING DEBUG] Rôle introuvable, ping annulé")
+    mid = size // 2
+    state = queue_ping_state[queue_id]
+
+    # Détermine si on doit pinger
+    now = datetime.now(timezone.utc)
+    cooldown = timedelta(minutes=PING_COOLDOWN_MINUTES)
+    first_ok = state["first_at"] is None or (now - state["first_at"]) > cooldown
+    should_ping_first = nb == 1 and first_ok
+    should_ping_mid   = nb == mid and not state["mid"] and state["first_at"] is not None
+    if not should_ping_first and not should_ping_mid:
         return
 
-    for row in rows:
-        uid = row["discord_id"]
-        if uid == joiner_uid or uid in queue_players:
-            continue
-        member = guild.get_member(int(uid))
-        if not member:
-            continue
-        has_role = required_role in member.roles if required_role else False
-        print(f"[PING DEBUG] membre={member.display_name} has_role={has_role}")
-        if not has_role:
-            continue
-        desc = f"**{joiner_name}** vient de rejoindre la queue.\n**{nb}/{size}** joueurs présents."
-        embed = discord.Embed(
-            title=f"🔔 Queue active — {q_info['name']}",
-            description=desc,
-            color=0x6553e8
-        )
-        embed.set_footer(text="Rejoins depuis 🎮︱queue · Désactive avec /notifications")
-        try:
-            await member.send(embed=embed)
-        except Exception:
-            pass
+    # Récupère le rôle requis pour mentionner
+    required_role_name = QUEUE_ROLES.get(queue_id)
+    required_role = discord.utils.get(guild.roles, name=required_role_name) if required_role_name else None
+    if required_role_name and not required_role:
+        return
+
+    # Récupère le salon chat
+    chat_ch = get_queue_chat_channel(guild, queue_id)
+    if not chat_ch:
+        return
+
+    # Construit le message
+    if should_ping_first:
+        state["first_at"] = datetime.now(timezone.utc)
+        state["mid"] = False
+        title = f"🟢 Queue lancée — {q_info['name']}"
+        desc = f"**{joiner_name}** a ouvert la queue ! Qui est chaud ?"
+    else:
+        state["mid"] = True
+        title = f"⏳ Mi-chemin — {q_info['name']}"
+        desc = f"**{nb}/{size}** joueurs en queue. Plus que {size - nb} pour lancer !"
+
+    embed = discord.Embed(title=title, description=desc, color=q_info["color"])
+    embed.set_footer(text="Rejoins depuis le salon queue • /notifications pour tes alertes DM")
+
+    mention = required_role.mention if required_role else ""
+    try:
+        await chat_ch.send(content=mention, embed=embed)
+    except Exception as e:
+        print(f"[PING] Erreur envoi chat {queue_id}: {e}")
 
 
 async def notify_player(guild: discord.Guild, uid: str, embed: discord.Embed):
@@ -1239,6 +1264,8 @@ async def _join_queue(interaction: discord.Interaction, uid: str, username: str,
     await ping_queue_watchers(interaction.guild, uid, username, queue_id, nb, current_size)
 
     if nb >= current_size:
+        # Reset complet au match lancé — prochaine session peut pinger immédiatement
+        queue_ping_state[queue_id] = {"first_at": None, "mid": False}
         await start_match(interaction, queue_id=queue_id)
 
 
@@ -1347,6 +1374,9 @@ class SharedQueueView(discord.ui.View):
         minutes = register_queue_leave(uid)
         msg = f"👋 Retiré de la queue. Cooldown **{minutes} min**." if minutes > 0 else "👋 Retiré de la queue."
         await interaction.response.send_message(msg, ephemeral=True)
+        # Reset mid si queue vide (first_at garde le cooldown temporel)
+        if len(queues[qid]) == 0:
+            queue_ping_state[qid]["mid"] = False
         await update_personal_queue_embeds(interaction.guild)
 
 
@@ -2743,7 +2773,17 @@ async def init_server_cmd(interaction: discord.Interaction):
     }
     cat_queues = await get_or_create_category("🎮 QUEUES")
     current_size = test_queue_size if test_mode else QUEUE_SIZE
+
+    # Permissions chat — membres peuvent écrire
+    ow_queue_chat = {
+        everyone:    ow_hidden(),
+        me:          ow_full(),
+        role_admin:  ow_full(),
+        role_membre: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+    }
+
     for qid, q_info in QUEUES.items():
+        # Salon embed queue (read-only)
         ch_q = await get_or_create_text(q_info["channel"], cat_queues, ow_queue_shared, f"Queue {q_info['name']}")
         has_msg = False
         async for msg in ch_q.history(limit=10):
@@ -2759,6 +2799,13 @@ async def init_server_cmd(interaction: discord.Interaction):
             embed_q.add_field(name="File d'attente", value=f"{'⬛' * current_size} **0/{current_size}**", inline=False)
             embed_q.set_footer(text="Choisis un rôle pour rejoindre • /notifications pour gérer tes alertes DM")
             await ch_q.send(embed=embed_q, view=SharedQueueView(qid))
+
+        # Salon chat (membres peuvent parler)
+        required_role = discord.utils.get(guild.roles, name=q_info["role"])
+        ow_chat = dict(ow_queue_chat)
+        if required_role:
+            ow_chat[required_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        await get_or_create_text(q_info["chat"], cat_queues, ow_chat, f"Chat {q_info['name']}")
 
     # ── CATÉGORIE : CLASSEMENTS (membres seulement, read-only) ───────
     ow_lb = {
