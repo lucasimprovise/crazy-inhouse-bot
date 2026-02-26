@@ -2594,7 +2594,7 @@ async def init_server_cmd(interaction: discord.Interaction):
 
     role_admin    = discord.utils.get(guild.roles, name="Admin") or await get_or_create_role("Admin", 0xff4655, hoist=True)
     role_coach    = discord.utils.get(guild.roles, name="Coach") or await get_or_create_role("Coach", 0xffd700, hoist=True)
-    await discord.utils.get(guild.roles, name="Scout") or await get_or_create_role("Scout", 0x00bcd4, hoist=True)
+    role_scout = discord.utils.get(guild.roles, name="Scout") or await get_or_create_role("Scout", 0x00bcd4, hoist=True)
     role_membre   = await get_or_create_role("Membre", 0x3ba55d, hoist=True)
     role_candidat = await get_or_create_role("Candidat", 0x747f8d, hoist=False)
 
