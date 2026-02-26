@@ -669,57 +669,49 @@ def balance_teams(players: list[dict]) -> tuple[list, list]:
 #  ESPACE PRIVÉ JOUEUR
 # ─────────────────────────────────────────────
 async def create_player_space(guild: discord.Guild, member: discord.Member):
-    """Crée la catégorie privée + 4 channels pour un nouveau joueur."""
+    """Enregistre le joueur en BDD et lui envoie un DM de bienvenue."""
     uid = str(member.id)
     conn = get_db()
     existing = conn.execute("SELECT * FROM player_channels WHERE discord_id=?", (uid,)).fetchone()
     if existing:
         conn.close()
-        return  # Déjà créé
+        return
+    conn.execute(
+        "INSERT OR REPLACE INTO player_channels (discord_id, notif_enabled) VALUES (?, 1)",
+        (uid,)
+    )
+    conn.commit()
+    conn.close()
 
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        member: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True, create_public_threads=False, create_private_threads=False, send_messages_in_threads=False, use_application_commands=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
-    }
-    # Staff/Coach voient aussi
-    coach_role = discord.utils.get(guild.roles, name="Coach")
-    if coach_role:
-        overwrites[coach_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-
+    # DM de bienvenue
     try:
-        cat = await guild.create_category(f"👤 {member.display_name}", overwrites=overwrites)
-        ch_queue   = await guild.create_text_channel("🎮︱queue",       category=cat, overwrites=overwrites)
-        # Profil : send_messages activé pour que /register fonctionne
-        overwrites_profil = dict(overwrites)
-        overwrites_profil[member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, create_public_threads=False, create_private_threads=False, use_application_commands=True)
-        ch_profil  = await guild.create_text_channel("📊︱profil",      category=cat, overwrites=overwrites_profil)
-        ch_notifs  = await guild.create_text_channel("🔔︱notifications", category=cat, overwrites=overwrites)
-        ch_history = await guild.create_text_channel("📜︱historique",  category=cat, overwrites=overwrites)
-
-        conn.execute(
-            "INSERT OR REPLACE INTO player_channels (discord_id, category_id, queue_channel, profil_channel, notifs_channel, history_channel) VALUES (?,?,?,?,?,?)",
-            (uid, cat.id, ch_queue.id, ch_profil.id, ch_notifs.id, ch_history.id)
+        embed = discord.Embed(
+            title="👋 Bienvenue sur Crazy Inhouse !",
+            description=(
+                "Tu as maintenant accès au serveur.\n\n"
+                "**Pour commencer :**\n"
+                "• `/register` — créer ton profil\n"
+                "• Rejoins la queue depuis le salon 🎮︱queue\n\n"
+                "**Tes stats et ton historique sont disponibles sur le site.**\n"
+                "Les notifs de match arrivent ici par DM."
+            ),
+            color=0x6553e8
         )
-        conn.commit()
-        conn.close()
+        await member.send(embed=embed)
+    except Exception:
+        pass  # DMs fermés
 
-        # Message initial dans chaque channel
-        await _init_queue_channel(ch_queue, member)
-        await _init_profil_channel(ch_profil, member, guild)
-        await ch_notifs.send(embed=discord.Embed(
-            title="🔔 Notifications",
-            description="Tu recevras ici toutes les alertes : match trouvé, résultat, changement de rang, etc.",
-            color=0x5865f2
-        ))
-        await ch_history.send(embed=discord.Embed(
-            title="📜 Historique",
-            description="Tes derniers matchs apparaîtront ici automatiquement après chaque partie.",
-            color=0x5865f2
-        ))
-    except Exception as e:
-        conn.close()
-        print(f"Erreur create_player_space pour {member.display_name}: {e}")
+
+def get_queue_channel(guild: discord.Guild, queue_id: str):
+    """Retourne le salon queue partagé pour une queue donnée."""
+    ch_name = QUEUES[queue_id]["channel"]  # ex: "queue-radiant"
+    for cat in guild.categories:
+        if "QUEUES" in cat.name.upper():
+            for ch in cat.channels:
+                if ch.name == ch_name:
+                    return ch
+    # Fallback global
+    return discord.utils.get(guild.text_channels, name=ch_name)
 
 
 def get_player_channels(uid: str):
@@ -832,16 +824,11 @@ async def _init_profil_channel(channel: discord.TextChannel, member: discord.Mem
 
 
 async def update_player_profil(guild: discord.Guild, uid: str):
-    """Met à jour le channel profil d'un joueur après un match."""
-    pch = get_player_channels(uid)
-    if not pch or not pch["profil_channel"]:
-        return
-    channel = guild.get_channel(pch["profil_channel"])
-    if not channel:
-        return
+    """Envoie le profil mis à jour par DM après un match."""
     member = guild.get_member(int(uid))
     if not member:
         return
+    channel = None  # on passe par DM, mais on garde la logique commune ci-dessous
 
     conn = get_db()
     row = conn.execute("SELECT * FROM players WHERE discord_id=?", (uid,)).fetchone()
@@ -869,21 +856,17 @@ async def update_player_profil(guild: discord.Guild, uid: str):
         embed.add_field(name="Compte Riot", value=f"`{row['riot_id']}`", inline=True)
     embed.set_footer(text=f"Mis à jour — {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC")
 
-    # Éditer le dernier message du bot dans le channel
-    async for msg in channel.history(limit=10):
-        if msg.author == guild.me and msg.embeds:
-            await msg.edit(embed=embed)
-            return
-    await channel.send(embed=embed)
+    # Envoyer le profil mis à jour par DM
+    try:
+        await member.send(embed=embed)
+    except Exception:
+        pass
 
 
 async def update_player_history(guild: discord.Guild, uid: str, match_id: str, won: bool, elo_change: dict, map_name: str):
-    """Poste le résultat du match dans le channel historique du joueur."""
-    pch = get_player_channels(uid)
-    if not pch or not pch["history_channel"]:
-        return
-    channel = guild.get_channel(pch["history_channel"])
-    if not channel:
+    """Envoie le résultat du match par DM au joueur."""
+    member = guild.get_member(int(uid))
+    if not member:
         return
 
     result_emoji = "✅" if won else "❌"
@@ -904,7 +887,10 @@ async def update_player_history(guild: discord.Guild, uid: str, match_id: str, w
     else:
         embed.add_field(name="ELO", value=f"{old_elo} ➜ **{new_elo}** (`{change}`) {ricon}", inline=True)
     embed.add_field(name="Match", value=f"`{match_id[-6:]}`", inline=True)
-    await channel.send(embed=embed)
+    try:
+        await member.send(embed=embed)
+    except Exception:
+        pass
 
 
 # Rôles Discord requis par queue
@@ -919,7 +905,7 @@ async def ping_queue_watchers(guild: discord.Guild, joiner_uid: str, joiner_name
     et qui ont le rôle Discord correspondant à cette queue."""
     conn = get_db()
     rows = conn.execute(
-        "SELECT discord_id, notifs_channel, notif_enabled FROM player_channels WHERE notif_enabled = 1"
+        "SELECT discord_id, notif_enabled FROM player_channels WHERE notif_enabled = 1"
     ).fetchall()
     conn.close()
 
@@ -943,98 +929,63 @@ async def ping_queue_watchers(guild: discord.Guild, joiner_uid: str, joiner_name
         print(f"[PING DEBUG] membre={member.display_name} has_role={has_role}")
         if not has_role:
             continue
-        notif_ch = guild.get_channel(row["notifs_channel"])
-        if not notif_ch:
-            continue
         desc = f"**{joiner_name}** vient de rejoindre la queue.\n**{nb}/{size}** joueurs présents."
         embed = discord.Embed(
             title=f"🔔 Queue active — {q_info['name']}",
             description=desc,
             color=0x6553e8
         )
-        embed.set_footer(text="Rejoins via ton salon 🎮︱queue · Désactive avec /notifications")
+        embed.set_footer(text="Rejoins depuis 🎮︱queue · Désactive avec /notifications")
         try:
-            await notif_ch.send(content=member.mention, embed=embed)
+            await member.send(embed=embed)
         except Exception:
             pass
 
 
 async def notify_player(guild: discord.Guild, uid: str, embed: discord.Embed):
-    """Envoie une notification dans le channel notifs du joueur."""
-    pch = get_player_channels(uid)
-    if not pch or not pch["notifs_channel"]:
-        return
-    channel = guild.get_channel(pch["notifs_channel"])
-    if channel:
-        await channel.send(embed=embed)
+    """Envoie une notification par DM au joueur."""
+    try:
+        member = guild.get_member(int(uid))
+        if member:
+            await member.send(embed=embed)
+    except Exception:
+        pass
 
 
 async def update_personal_queue_embeds(guild: discord.Guild):
-    """Met à jour l'embed de queue dans tous les channels personnels."""
-    conn = get_db()
-    rows = conn.execute("SELECT discord_id, queue_channel, queue_message_id FROM player_channels").fetchall()
-    conn.close()
-    for row in rows:
+    """Met à jour l'embed dans chaque salon queue partagé (un par queue)."""
+    current_size = test_queue_size if test_mode else QUEUE_SIZE
+    for queue_id, q_info in QUEUES.items():
+        ch = get_queue_channel(guild, queue_id)
+        if not ch:
+            continue
         try:
-            ch = guild.get_channel(row["queue_channel"])
-            if not ch:
-                continue
-
-            uid = row["discord_id"]
-            msg = None
-
-            # Méthode 1 : ID direct stocké en DB (fiable)
-            if row["queue_message_id"]:
-                try:
-                    msg = await ch.fetch_message(row["queue_message_id"])
-                except Exception:
-                    msg = None
-
-            # Méthode 2 : fallback scan historique (limit élevée)
-            if msg is None:
-                async for m in ch.history(limit=50):
-                    if m.author == guild.me and m.embeds and m.components:
-                        msg = m
-                        # Sauvegarder l'ID trouvé pour la prochaine fois
-                        conn2 = get_db()
-                        conn2.execute("UPDATE player_channels SET queue_message_id=? WHERE discord_id=?", (m.id, uid))
-                        conn2.commit()
-                        conn2.close()
-                        break
-
-            if not msg:
-                continue
-
-            old_embed = msg.embeds[0]
-            new_embed = discord.Embed(
-                title=old_embed.title,
-                description=old_embed.description,
-                color=old_embed.color.value if old_embed.color else 0xff4655
+            nb = len(queues[queue_id])
+            bar = "🟩" * nb + "⬛" * (current_size - nb)
+            embed = discord.Embed(
+                title=f"{q_info['emoji']} {q_info['name']}",
+                description="Choisis ton rôle et rejoins la file d'attente.",
+                color=q_info["color"]
             )
-            for field in old_embed.fields:
-                if field.name not in ("File d'attente", "🎯 Statut"):
-                    new_embed.add_field(name=field.name, value=field.value, inline=field.inline)
+            embed.add_field(name="File d'attente", value=f"{bar} **{nb}/{current_size}**", inline=False)
+            if queues[queue_id]:
+                players_list = "\n".join(
+                    f"• {p['name']} — {p['role']}" for p in queues[queue_id]
+                )
+                embed.add_field(name="Joueurs en attente", value=players_list, inline=False)
+            embed.set_footer(text="Choisis un rôle pour rejoindre • /notifications pour gérer tes alertes DM")
 
-            qid = get_player_queue_id(uid)
-            in_queue = qid is not None
-            in_match = any(uid in [p["id"] for p in m["team1"] + m["team2"]] for m in active_matches.values())
-            current_size = test_queue_size if test_mode else QUEUE_SIZE
-
-            if in_match:
-                new_embed.add_field(name="🎯 Statut", value="⚔️ **Match en cours !** Va dans ton salon scoreboard.", inline=False)
-            elif in_queue:
-                q_name = QUEUES[qid]["emoji"] + " " + QUEUES[qid]["name"]
-                q = queues[qid]
-                pos = next((i+1 for i, p in enumerate(q) if p["id"] == uid), "?")
-                new_embed.add_field(name="🎯 Statut", value=f"✅ **En queue** {q_name} — Position **{pos}/{current_size}** ({len(q)} joueur(s))", inline=False)
+            msg = None
+            async for m in ch.history(limit=20):
+                if m.author == guild.me and m.components:
+                    msg = m
+                    break
+            if msg:
+                await msg.edit(embed=embed)
             else:
-                new_embed.add_field(name="🎯 Statut", value="⏸️ Pas en queue — Choisis ton rôle pour rejoindre !", inline=False)
-
-            if old_embed.footer:
-                new_embed.set_footer(text=old_embed.footer.text)
-            await msg.edit(embed=new_embed)
+                await ch.send(embed=embed, view=SharedQueueView(queue_id))
         except Exception as e:
-            print(f"Erreur update_personal_queue_embeds [{row['discord_id']}]: {e}")
+            print(f"Erreur update_queue_embed [{queue_id}]: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -1330,6 +1281,73 @@ class RoleSelectView(discord.ui.View):
         # Legacy RoleSelectView - redirige vers le salon personnel
         await interaction.response.send_message("⚠️ Utilise ton salon 🎮︱queue personnel !", ephemeral=True)
 
+
+
+class SharedQueueView(discord.ui.View):
+    """Vue persistante dans le salon queue partagé — un par queue."""
+    def __init__(self, queue_id: str):
+        super().__init__(timeout=None)
+        self.queue_id = queue_id
+
+        roles = [
+            ("⚔️ Duelliste",  "Duelliste",  discord.ButtonStyle.danger,   f"sq_duel_{queue_id}"),
+            ("🔦 Initiateur", "Initiateur", discord.ButtonStyle.primary,  f"sq_init_{queue_id}"),
+            ("💨 Contrôleur", "Contrôleur", discord.ButtonStyle.success,  f"sq_ctrl_{queue_id}"),
+            ("🛡️ Sentinelle", "Sentinelle", discord.ButtonStyle.secondary, f"sq_sent_{queue_id}"),
+            ("🔄 Flex",       "Flex",       discord.ButtonStyle.secondary, f"sq_flex_{queue_id}"),
+        ]
+        for label, role, style, cid in roles:
+            btn = discord.ui.Button(label=label, style=style, custom_id=cid, row=0)
+            btn.callback = self._make_join_cb(role)
+            self.add_item(btn)
+
+        leave_btn = discord.ui.Button(
+            label="❌ Quitter la queue", style=discord.ButtonStyle.danger,
+            custom_id=f"sq_leave_{queue_id}", row=1
+        )
+        leave_btn.callback = self._leave_cb
+        self.add_item(leave_btn)
+
+    def _make_join_cb(self, role: str):
+        queue_id = self.queue_id
+        async def callback(interaction: discord.Interaction):
+            uid = str(interaction.user.id)
+            conn = get_db()
+            row = conn.execute("SELECT * FROM players WHERE discord_id=?", (uid,)).fetchone()
+            conn.close()
+            if not row:
+                await interaction.response.send_message("❌ Tu n'es pas inscrit ! Utilise `/register`.", ephemeral=True)
+                return
+            if uid in cooldowns and datetime.now(timezone.utc) < cooldowns[uid]:
+                remaining = int((cooldowns[uid] - datetime.now(timezone.utc)).total_seconds() / 60) + 1
+                await interaction.response.send_message(f"⏳ Cooldown actif : encore **{remaining} min**.", ephemeral=True)
+                return
+            for m in active_matches.values():
+                if uid in [p["id"] for p in m["team1"] + m["team2"]]:
+                    await interaction.response.send_message("⚠️ Tu as déjà un match en cours !", ephemeral=True)
+                    return
+            if get_player_queue_id(uid):
+                await interaction.response.send_message("⚠️ Tu es déjà en queue !", ephemeral=True)
+                return
+            if not player_has_queue_access(interaction.user, queue_id):
+                await interaction.response.send_message(
+                    f"❌ Tu n'as pas accès à cette queue.", ephemeral=True
+                )
+                return
+            await _join_queue(interaction, uid, interaction.user.display_name, role, queue_id)
+        return callback
+
+    async def _leave_cb(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        qid = get_player_queue_id(uid)
+        if not qid:
+            await interaction.response.send_message("⚠️ Tu n'es pas en queue !", ephemeral=True)
+            return
+        queues[qid] = [p for p in queues[qid] if p["id"] != uid]
+        minutes = register_queue_leave(uid)
+        msg = f"👋 Retiré de la queue. Cooldown **{minutes} min**." if minutes > 0 else "👋 Retiré de la queue."
+        await interaction.response.send_message(msg, ephemeral=True)
+        await update_personal_queue_embeds(interaction.guild)
 
 
 class QueueView(discord.ui.View):
@@ -1713,6 +1731,7 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
     guild = guild_override or interaction.guild
     try:
         coach_role = discord.utils.get(guild.roles, name="Coach")
+        scout_role = discord.utils.get(guild.roles, name="Scout")
 
         # Catégorie visible par tout le monde
         cat = await guild.create_category(f"🎮 Match {match_id[-6:]}")
@@ -1729,6 +1748,8 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
         }
         if coach_role:
             overwrites_coach[coach_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        if scout_role:
+            overwrites_coach[scout_role] = discord.PermissionOverwrite(view_channel=True, send_messages=False)
         tc_coach = await guild.create_text_channel("📋 notes-coach", category=cat, overwrites=overwrites_coach)
 
         # Channel scoreboard — visible par les joueurs réels du match + staff
@@ -1738,6 +1759,8 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
         }
         if coach_role:
             overwrites_sb[coach_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True)
+        if scout_role:
+            overwrites_sb[scout_role] = discord.PermissionOverwrite(view_channel=True, send_messages=False)
         for p in team1 + team2:
             if p.get("is_bot"):
                 continue  # Ignorer les faux joueurs — pas de vrai membre Discord
@@ -1840,16 +1863,14 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
                 if p.get("is_bot"):
                     continue
                 try:
-                    pch = get_player_channels(p["id"])
-                    if pch and pch["notifs_channel"]:
-                        notif_ch = guild.get_channel(pch["notifs_channel"])
-                        if notif_ch:
-                            team_num = 1 if p in team1 else 2
-                            await notif_ch.send(embed=discord.Embed(
-                                title="🗺️ Map sélectionnée",
-                                description=f"**{final_map}** — Team {team_num}\nBonne chance !",
-                                color=0xff4655
-                            ))
+                    member_p = guild.get_member(int(p["id"]))
+                    if member_p:
+                        team_num = 1 if p in team1 else 2
+                        await member_p.send(embed=discord.Embed(
+                            title="🗺️ Map sélectionnée",
+                            description=f"**{final_map}** — Team {team_num}\nBonne chance !",
+                            color=0xff4655
+                        ))
                 except Exception:
                     pass
 
@@ -2573,6 +2594,7 @@ async def init_server_cmd(interaction: discord.Interaction):
 
     role_admin    = discord.utils.get(guild.roles, name="Admin") or await get_or_create_role("Admin", 0xff4655, hoist=True)
     role_coach    = discord.utils.get(guild.roles, name="Coach") or await get_or_create_role("Coach", 0xffd700, hoist=True)
+    await discord.utils.get(guild.roles, name="Scout") or await get_or_create_role("Scout", 0x00bcd4, hoist=True)
     role_membre   = await get_or_create_role("Membre", 0x3ba55d, hoist=True)
     role_candidat = await get_or_create_role("Candidat", 0x747f8d, hoist=False)
 
@@ -2656,7 +2678,7 @@ async def init_server_cmd(interaction: discord.Interaction):
         everyone:     ow_hidden(),
         me:           ow_full(),
         role_admin:   ow_full(),
-        role_coach:   ow_write(),
+        # Les coachs n'ont pas accès aux salons staff
     }
     cat_staff = await get_or_create_category("🛡️ STAFF")
     await get_or_create_text("candidatures-en-cours", cat_staff, ow_staff, "Candidatures en attente de validation")
@@ -2685,6 +2707,32 @@ async def init_server_cmd(interaction: discord.Interaction):
         role_admin:  discord.PermissionOverwrite(view_channel=True, connect=True),
         me:          discord.PermissionOverwrite(view_channel=True, connect=True),
     })
+
+    # ── CATÉGORIE : QUEUES — un salon par queue ─────────────────────────
+    ow_queue_shared = {
+        everyone:    ow_hidden(),
+        me:          ow_full(),
+        role_admin:  ow_full(),
+        role_membre: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True, use_application_commands=True),
+    }
+    cat_queues = await get_or_create_category("🎮 QUEUES")
+    current_size = test_queue_size if test_mode else QUEUE_SIZE
+    for qid, q_info in QUEUES.items():
+        ch_q = await get_or_create_text(q_info["channel"], cat_queues, ow_queue_shared, f"Queue {q_info['name']}")
+        has_msg = False
+        async for msg in ch_q.history(limit=10):
+            if msg.author == me and msg.components:
+                has_msg = True
+                break
+        if not has_msg:
+            embed_q = discord.Embed(
+                title=f"{q_info['emoji']} {q_info['name']}",
+                description="Choisis ton rôle et rejoins la file d'attente.",
+                color=q_info["color"]
+            )
+            embed_q.add_field(name="File d'attente", value=f"{'⬛' * current_size} **0/{current_size}**", inline=False)
+            embed_q.set_footer(text="Choisis un rôle pour rejoindre • /notifications pour gérer tes alertes DM")
+            await ch_q.send(embed=embed_q, view=SharedQueueView(qid))
 
     # ── CATÉGORIE : CLASSEMENTS (membres seulement, read-only) ───────
     ow_lb = {
@@ -2812,10 +2860,10 @@ async def queue_cmd(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
         return
-    view = QueueView()
-    await interaction.response.send_message(embed=build_queue_embed(), view=view)
-    msg = await interaction.original_response()
-    queue_message_refs["global"] = {"channel_id": interaction.channel_id, "message_id": msg.id}
+    await interaction.response.send_message(
+        "ℹ️ Les embeds de queue sont maintenant dans les salons `🎮 QUEUES`. Lance `/initserver` pour les (re)créer.",
+        ephemeral=True
+    )
 
 
 @tree.command(name="clearqueue", description="[ADMIN] Vider la queue")
@@ -3009,6 +3057,38 @@ async def setup_spaces_cmd(interaction: discord.Interaction):
         f"✅ **{count}** espace(s) créé(s).\n⏭️ **{skipped}** membre(s) ignoré(s) (pas encore validés).",
         ephemeral=True
     )
+
+
+@tree.command(name="addscout", description="[ADMIN] Attribuer le rôle Scout à un membre")
+@app_commands.describe(user="Membre à promouvoir Scout")
+async def addscout_cmd(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    scout_role = discord.utils.get(interaction.guild.roles, name="Scout")
+    if not scout_role:
+        scout_role = await interaction.guild.create_role(
+            name="Scout", color=discord.Color.from_str("#00bcd4"), hoist=True
+        )
+    await user.add_roles(scout_role)
+    await interaction.response.send_message(
+        f"✅ **{user.display_name}** est maintenant **Scout** ! Il peut observer les matchs en lecture seule.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="removescout", description="[ADMIN] Retirer le rôle Scout à un membre")
+@app_commands.describe(user="Membre à rétrograder")
+async def removescout_cmd(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    scout_role = discord.utils.get(interaction.guild.roles, name="Scout")
+    if scout_role and scout_role in user.roles:
+        await user.remove_roles(scout_role)
+        await interaction.response.send_message(f"✅ Rôle Scout retiré à **{user.display_name}**.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"⚠️ {user.display_name} n'a pas le rôle Scout.", ephemeral=True)
 
 
 @tree.command(name="addcoach", description="[ADMIN] Attribuer le rôle Coach à un membre")
@@ -3340,58 +3420,6 @@ async def notifications_cmd(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="syncnotifs", description="[ADMIN] Ajoute le bouton de notifs dans tous les salons profil existants")
-async def syncnotifs_cmd(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-    conn = get_db()
-    rows = conn.execute("SELECT discord_id, profil_channel, notif_enabled FROM player_channels").fetchall()
-    conn.close()
-
-    ok, skip, fail = 0, 0, 0
-    for row in rows:
-        uid = row["discord_id"]
-        channel = guild.get_channel(row["profil_channel"])
-        if not channel:
-            fail += 1
-            continue
-
-        # Vérifie si le bouton existe déjà
-        has_button = False
-        async for msg in channel.history(limit=20):
-            if msg.author == guild.me and msg.components:
-                has_button = True
-                break
-
-        if has_button:
-            skip += 1
-            continue
-
-        enabled = row["notif_enabled"] if row["notif_enabled"] is not None else 1
-        view = NotifToggleView()
-        view.children[0].label = "🔔 Alertes queue : ON" if enabled else "🔕 Alertes queue : OFF"
-        view.children[0].style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
-        notif_embed = discord.Embed(
-            title="🔔 Alertes Queue",
-            description="Reçois une mention dans ce salon dès que quelqu\'un rejoint une queue.",
-            color=0x6553e8
-        )
-        try:
-            await channel.send(embed=notif_embed, view=view)
-            ok += 1
-        except Exception:
-            fail += 1
-
-    await interaction.followup.send(
-        f"✅ Bouton ajouté : **{ok}** salons\n⏭️ Déjà présent : **{skip}** salons\n❌ Erreur : **{fail}** salons",
-        ephemeral=True
-    )
-
-
 @tree.command(name="debugroles", description="[ADMIN] Voir les noms exacts des rôles du serveur")
 async def debugroles_cmd(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -3408,6 +3436,76 @@ async def debugroles_cmd(interaction: discord.Interaction):
     txt += "\n\n**Mapping actuel dans le bot :**\n"
     txt += "\n".join(f"• {qid} → {status}" for qid, status in found.items())
     await interaction.response.send_message(txt, ephemeral=True)
+
+
+@tree.command(name="deleteplayer", description="[ADMIN] Supprimer un joueur de la BDD et son espace privé")
+@app_commands.describe(user="Joueur à supprimer")
+async def deleteplayer_cmd(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    uid = str(user.id)
+    conn = get_db()
+
+    # Récupère les channels avant suppression
+    pch = conn.execute("SELECT * FROM player_channels WHERE discord_id=?", (uid,)).fetchone()
+
+    # Supprime de toutes les tables
+    conn.execute("DELETE FROM players WHERE discord_id=?", (uid,))
+    conn.execute("DELETE FROM player_channels WHERE discord_id=?", (uid,))
+    conn.execute("DELETE FROM player_queue_elo WHERE discord_id=?", (uid,))
+    conn.execute("DELETE FROM applications WHERE discord_id=?", (uid,))
+    conn.commit()
+    conn.close()
+
+    await interaction.followup.send(
+        f"✅ **{user.display_name}** supprimé de la BDD.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="purgeplayerspaces", description="[ADMIN] Supprimer toutes les catégories privées joueurs (👤 ...)")
+async def purgeplayerspaces_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    deleted_cats = 0
+    deleted_channels = 0
+    errors = 0
+
+    for cat in list(guild.categories):
+        if not cat.name.startswith("👤"):
+            continue
+        for ch in list(cat.channels):
+            try:
+                await ch.delete()
+                deleted_channels += 1
+            except Exception:
+                errors += 1
+        try:
+            await cat.delete()
+            deleted_cats += 1
+        except Exception:
+            errors += 1
+
+    # Nettoie les colonnes de channel dans la BDD (garde notif_enabled)
+    conn = get_db()
+    conn.execute("UPDATE player_channels SET category_id=NULL, queue_channel=NULL, profil_channel=NULL, notifs_channel=NULL, history_channel=NULL, queue_message_id=NULL")
+    conn.commit()
+    conn.close()
+
+    await interaction.followup.send(
+        f"✅ Purge terminée !\n"
+        f"• **{deleted_cats}** catégories supprimées\n"
+        f"• **{deleted_channels}** salons supprimés\n"
+        f"• **{errors}** erreurs\n\n"
+        f"Les joueurs conservent leur profil en BDD. Lance `/initserver` pour recréer la structure si besoin.",
+        ephemeral=True
+    )
 
 
 @tree.command(name="dbstats", description="[ADMIN] Voir l'état de la base de données")
@@ -3547,23 +3645,21 @@ async def lobbycode_cmd(interaction: discord.Interaction, code: str):
         embed.set_footer(text=f"Partagé par {interaction.user.display_name}")
         await sb_ch.send(embed=embed)
 
-    # Envoyer dans les notifs privées de chaque joueur
+    # Envoyer par DM à chaque joueur
     sent = 0
     for p in team1 + team2:
         if p.get("is_bot"):
             continue
         try:
-            pch = get_player_channels(p["id"])
-            if pch and pch["notifs_channel"]:
-                notif_ch = guild.get_channel(pch["notifs_channel"])
-                if notif_ch:
-                    notif_embed = discord.Embed(
-                        title="🎮 Code Lobby — Match en cours",
-                        description=f"```{code}```\nValorant → **Jeu Personnalisé** → **Rejoindre**",
-                        color=0xff4655
-                    )
-                    await notif_ch.send(embed=notif_embed)
-                    sent += 1
+            member_p = guild.get_member(int(p["id"]))
+            if member_p:
+                notif_embed = discord.Embed(
+                    title="🎮 Code Lobby — Match en cours",
+                    description=f"```{code}```\nValorant → **Jeu Personnalisé** → **Rejoindre**",
+                    color=0xff4655
+                )
+                await member_p.send(embed=notif_embed)
+                sent += 1
         except Exception:
             pass
 
@@ -3600,12 +3696,28 @@ async def on_member_join(member: discord.Member):
 
 
 @bot.event
+async def on_member_remove(member: discord.Member):
+    """Supprime automatiquement un joueur quand il quitte le serveur."""
+    uid = str(member.id)
+    conn = get_db()
+    pch = conn.execute("SELECT * FROM player_channels WHERE discord_id=?", (uid,)).fetchone()
+    conn.execute("DELETE FROM players WHERE discord_id=?", (uid,))
+    conn.execute("DELETE FROM player_channels WHERE discord_id=?", (uid,))
+    conn.execute("DELETE FROM player_queue_elo WHERE discord_id=?", (uid,))
+    conn.execute("DELETE FROM applications WHERE discord_id=?", (uid,))
+    conn.commit()
+    conn.close()
+
+    print(f"[AUTO] {member.display_name} a quitté — BDD supprimée")
+
+
+@bot.event
 async def on_ready():
     init_db()
     # Vues statiques persistantes
     bot.add_view(ApplicationButtonView())
-    bot.add_view(QueueView())
-    bot.add_view(NotifToggleView())
+    for qid in QUEUES:
+        bot.add_view(SharedQueueView(qid))
 
     # Réenregistrer les PersonalQueueView de chaque joueur (custom_id dynamique)
     conn = get_db()
@@ -3642,7 +3754,8 @@ async def on_ready():
         print(f"✅ {len(synced)} commandes synchronisées sur le serveur")
     except Exception as e:
         print(f"❌ Erreur sync: {e}")
-    bot.add_view(QueueView())
+    for qid in QUEUES:
+        bot.add_view(SharedQueueView(qid))
     queue_timeout_check.start()
     print("✅ Bot prêt !")
 
