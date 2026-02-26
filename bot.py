@@ -2290,7 +2290,7 @@ async def register(interaction: discord.Interaction):
     await update_player_profil(interaction.guild, uid)
 
     embed = discord.Embed(title="✅ Inscription réussie !", description=f"Bienvenue **{interaction.user.display_name}** ! Tu commences avec **1000 ELO** 🟫 Bronze.", color=0x00ff88)
-    embed.add_field(name="Prochaine étape", value="Va dans ton salon privé `🎮︱queue` pour rejoindre la file d'attente !")
+    embed.add_field(name="Prochaine étape", value="Lie ton compte Riot avec `/setriot`, puis rejoins la queue depuis le salon correspondant à ton niveau !")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -2707,6 +2707,32 @@ async def init_server_cmd(interaction: discord.Interaction):
         role_admin:  discord.PermissionOverwrite(view_channel=True, connect=True),
         me:          discord.PermissionOverwrite(view_channel=True, connect=True),
     })
+
+    # Salon commandes — membres peuvent écrire pour /register, /rank, /stats etc.
+    ow_cmds = {
+        everyone:    ow_hidden(),
+        me:          ow_full(),
+        role_admin:  ow_full(),
+        role_membre: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, use_application_commands=True),
+        role_candidat: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True, use_application_commands=True),
+    }
+    ch_cmds = await get_or_create_text("📝︱commandes", cat_general, ow_cmds, "Utilise ici /register, /rank, /stats, /setriot")
+    async for msg in ch_cmds.history(limit=5):
+        if msg.author == me and msg.embeds:
+            break
+    else:
+        await ch_cmds.send(embed=discord.Embed(
+            title="📝 Commandes disponibles",
+            description=(
+                "Utilise ce salon pour toutes les commandes du bot :\n\n"
+                "• `/register` — créer ton profil\n"
+                "• `/setriot` — lier ton compte Riot\n"
+                "• `/rank` — voir ton rang et tes stats\n"
+                "• `/stats` — historique détaillé\n"
+                "• `/notifications` — activer/désactiver les alertes DM"
+            ),
+            color=0x6553e8
+        ))
 
     # ── CATÉGORIE : QUEUES — un salon par queue ─────────────────────────
     ow_queue_shared = {
