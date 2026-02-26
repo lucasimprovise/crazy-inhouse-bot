@@ -48,11 +48,11 @@ QUEUES = {
     },
     "ascendant": {
         "id":          "ascendant",
-        "name":        "💎 Ascendant / Immo",
+        "name":        "💎 Ascendant / Immo3",
         "role":        "Queue Ascendant",
         "color":       0x9b59b6,
         "emoji":       "💎",
-        "channel":     "queue-ascendant",
+        "channel":     "queue-ascendant-immo",
     },
     "gamechangers": {
         "id":          "gamechangers",
@@ -2421,7 +2421,7 @@ async def fill_channels_cmd(interaction: discord.Interaction):
         ef = discord.Embed(title="\u2753 Questions fr\u00e9quentes", color=0xff4655)
         ef.add_field(name="Comment s'inscrire ?", value="Poste ta candidature dans \U0001f39f\ufe0f\ufe0f\ufe0e\ufe0f\u200b\u200b\u200bcandidat\u200bures. Un admin la validera. Une fois accept\u00e9, utilise `/register` dans ton salon priv\u00e9.", inline=False)
         ef.add_field(name="Comment rejoindre une queue ?", value="Va dans ton salon priv\u00e9 \U0001f3ae\ufe0f\u200b\u200bqueue et clique sur ton r\u00f4le. D\u00e8s que 10 joueurs sont pr\u00eats, le match se lance automatiquement.", inline=False)
-        ef.add_field(name="C'est quoi les diff\u00e9rentes queues ?", value="\U0001f451 **Radiant / Immo3** \u2014 niveau pro / ex-pro / top radiant\n\U0001f48e **Ascendant / Immo** \u2014 niveau haut pour un cadre plus s\u00e9rieux\n\U0001f338 **Game Changers** \u2014 r\u00e9serv\u00e9e aux joueuses", inline=False)
+        ef.add_field(name="C'est quoi les diff\u00e9rentes queues ?", value="\U0001f451 **Radiant / Immo3** \u2014 niveau pro / ex-pro / top radiant\n\U0001f48e **Ascendant / Immo3** \u2014 niveau haut pour un cadre plus s\u00e9rieux\n\U0001f338 **Game Changers** \u2014 r\u00e9serv\u00e9e aux joueuses", inline=False)
         ef.add_field(name="Comment est calcul\u00e9 l'ELO ?", value="Base 1000 pts. +/- selon r\u00e9sultat, ELO moyen des \u00e9quipes et MVP. Les 10 premi\u00e8res parties sont des placements (ELO masqu\u00e9).", inline=False)
         ef.add_field(name="Score contest\u00e9 ?", value="Contacte un admin dans le salon de match. Le screenshot du scoreboard fait foi.", inline=False)
         ef.add_field(name="Abandon involontaire ?", value="Contacte un admin. Les abandons involontaires (crash, urgence) peuvent \u00eatre excus\u00e9s si signal\u00e9s rapidement.", inline=False)
@@ -2621,7 +2621,7 @@ async def init_server_cmd(interaction: discord.Interaction):
         return cat
 
     async def get_or_create_text(name, category, overwrites, topic=""):
-        ch = discord.utils.get(guild.text_channels, name=name)
+        ch = discord.utils.get(guild.text_channels, name=name, category=category)
         if not ch:
             ch = await guild.create_text_channel(name, category=category, overwrites=overwrites, topic=topic)
         return ch
@@ -2849,7 +2849,7 @@ async def setup_cmd(interaction: discord.Interaction):
 @app_commands.describe(queue="Queue à afficher")
 @app_commands.choices(queue=[
     app_commands.Choice(name="👑 Radiant / Immo3", value="radiant"),
-    app_commands.Choice(name="💎 Ascendant / Immo", value="ascendant"),
+    app_commands.Choice(name="💎 Ascendant / Immo3", value="ascendant"),
     app_commands.Choice(name="🌸 Game Changers", value="gamechangers"),
 ])
 async def leaderboard_cmd(interaction: discord.Interaction, queue: str = "radiant"):
@@ -2958,7 +2958,7 @@ async def new_season(interaction: discord.Interaction):
 @app_commands.describe(user="Joueur", queue="Queue à attribuer")
 @app_commands.choices(queue=[
     app_commands.Choice(name="👑 Radiant / Immo3", value="radiant"),
-    app_commands.Choice(name="💎 Ascendant / Immo", value="ascendant"),
+    app_commands.Choice(name="💎 Ascendant / Immo3", value="ascendant"),
     app_commands.Choice(name="🌸 Game Changers", value="gamechangers"),
 ])
 async def set_queue_cmd(interaction: discord.Interaction, user: discord.Member, queue: str):
@@ -2992,7 +2992,7 @@ async def set_queue_cmd(interaction: discord.Interaction, user: discord.Member, 
 @app_commands.describe(user="Joueur", queue="Queue à ajouter")
 @app_commands.choices(queue=[
     app_commands.Choice(name="👑 Radiant / Immo3", value="radiant"),
-    app_commands.Choice(name="💎 Ascendant / Immo", value="ascendant"),
+    app_commands.Choice(name="💎 Ascendant / Immo3", value="ascendant"),
     app_commands.Choice(name="🌸 Game Changers", value="gamechangers"),
 ])
 async def add_queue_cmd(interaction: discord.Interaction, user: discord.Member, queue: str):
@@ -3015,7 +3015,7 @@ async def add_queue_cmd(interaction: discord.Interaction, user: discord.Member, 
 @app_commands.describe(user="Joueur", queue="Queue à retirer")
 @app_commands.choices(queue=[
     app_commands.Choice(name="👑 Radiant / Immo3", value="radiant"),
-    app_commands.Choice(name="💎 Ascendant / Immo", value="ascendant"),
+    app_commands.Choice(name="💎 Ascendant / Immo3", value="ascendant"),
     app_commands.Choice(name="🌸 Game Changers", value="gamechangers"),
 ])
 async def remove_queue_cmd(interaction: discord.Interaction, user: discord.Member, queue: str):
