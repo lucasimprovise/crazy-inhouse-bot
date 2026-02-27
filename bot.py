@@ -683,15 +683,18 @@ async def sync_rank_role(guild: discord.Guild, member: discord.Member, elo: int)
 # ─────────────────────────────────────────────
 
 # Rang Valorant → ELO approximatif pour l'équilibrage
+# Mapping rang → score d'équilibrage
+# Courbe non-linéaire : le gouffre A1→I3 est marqué,
+# A3→I1/I2 reste serré, I3 et Radiant s'envolent
 VAL_TIER_ELO = {
-    "Iron 1": 100, "Iron 2": 133, "Iron 3": 166,
-    "Bronze 1": 200, "Bronze 2": 233, "Bronze 3": 266,
-    "Silver 1": 300, "Silver 2": 333, "Silver 3": 366,
-    "Gold 1": 400, "Gold 2": 433, "Gold 3": 466,
-    "Platinum 1": 500, "Platinum 2": 533, "Platinum 3": 566,
-    "Diamond 1": 600, "Diamond 2": 633, "Diamond 3": 666,
-    "Ascendant 1": 700, "Ascendant 2": 733, "Ascendant 3": 766,
-    "Immortal 1": 800, "Immortal 2": 833, "Immortal 3": 866,
+    "Iron 1": 100, "Iron 2": 130, "Iron 3": 160,
+    "Bronze 1": 190, "Bronze 2": 220, "Bronze 3": 250,
+    "Silver 1": 280, "Silver 2": 310, "Silver 3": 340,
+    "Gold 1": 370, "Gold 2": 400, "Gold 3": 430,
+    "Platinum 1": 460, "Platinum 2": 490, "Platinum 3": 520,
+    "Diamond 1": 550, "Diamond 2": 580, "Diamond 3": 615,
+    "Ascendant 1": 650, "Ascendant 2": 675, "Ascendant 3": 700,
+    "Immortal 1": 730, "Immortal 2": 770, "Immortal 3": 850,
     "Radiant": 1000,
 }
 
@@ -746,10 +749,12 @@ def balance_teams(players: list[dict]) -> tuple[list, list]:
     for p in players:
         row = conn.execute("SELECT elo, val_elo FROM players WHERE discord_id = ?", (p["id"],)).fetchone()
         internal_elo = row["elo"] if row else 1000
-        # Si on a un rang Riot vérifié, on mixe les deux (60% interne + 40% Riot)
-        if row and row["val_elo"]:
-            val_elo_normalized = row["val_elo"] / 2.0  # val_elo va jusqu'à ~2000+, on normalise
-            elos[p["id"]] = round(internal_elo * 0.6 + val_elo_normalized * 0.4)
+        # Si on a un rang Riot vérifié, on mixe ELO interne + score du rang (60/40)
+        if row and row["val_rank"] and row["val_rank"] in VAL_TIER_ELO:
+            val_score = VAL_TIER_ELO[row["val_rank"]]
+            # Normalise val_score (0-1000) vers l'échelle interne (≈500-1800)
+            val_score_scaled = 500 + val_score * 1.3
+            elos[p["id"]] = round(internal_elo * 0.6 + val_score_scaled * 0.4)
         else:
             elos[p["id"]] = internal_elo
     conn.close()
