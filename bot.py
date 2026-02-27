@@ -3482,9 +3482,12 @@ def build_history_embed(matches: list, page: int, total_pages: int, target_name:
                         pname = member.display_name
                 elo_delta = elo_changes.get(pid, {})
                 if isinstance(elo_delta, dict):
-                    delta = elo_delta.get("change", 0)
+                    delta = int(elo_delta.get("change", 0) or 0)
                 else:
-                    delta = elo_delta
+                    try:
+                        delta = int(elo_delta or 0)
+                    except (ValueError, TypeError):
+                        delta = 0
                 delta_str = f"+{delta}" if delta > 0 else str(delta)
                 color = "🟢" if delta > 0 else "🔴"
                 won = (w == team_num)
@@ -3923,8 +3926,21 @@ def build_shop_embed(rotating: bool = False, uid: str = None) -> discord.Embed:
         lines = []
         for item in items:
             icon = item["emoji"] or ""
-            lines.append(f"`#{item['id']}` {icon} **{item['name']}** — **{item['price']} pts**\n*{item['description'] or ''}*")
-        embed.add_field(name=type_labels.get(t, t), value="\n".join(lines), inline=False)
+            lines.append(f"`{item['id']}` {icon} {item['name']} · **{item['price']}pts**")
+        # Découper en chunks de max 1024 chars
+        label = type_labels.get(t, t)
+        chunk, chunk_num = [], 1
+        sep = "\n"
+        for line in lines:
+            test = sep.join(chunk + [line])
+            if len(test) > 800:
+                embed.add_field(name=f"{label}{' (suite)' if chunk_num > 1 else ''}", value=sep.join(chunk), inline=False)
+                chunk = [line]
+                chunk_num += 1
+            else:
+                chunk.append(line)
+        if chunk:
+            embed.add_field(name=f"{label}{' (suite)' if chunk_num > 1 else ''}", value=sep.join(chunk), inline=False)
 
     embed.set_footer(text="Utilise /acheter <id> pour acheter • /equiper <id> pour équiper")
     return embed
