@@ -31,7 +31,7 @@ tree = bot.tree
 QUEUE_SIZE         = 10
 K_FACTOR           = 32
 K_FACTOR_PLACEMENT = 64     # K-factor doublé pendant les placements
-PLACEMENT_MATCHES  = 10     # nombre de matchs de placement
+PLACEMENT_MATCHES  = 5      # nombre de matchs de placement
 QUEUE_TIMEOUT      = 30     # minutes avant kick auto de la queue
 ABANDON_COOLDOWN   = 15     # minutes de cooldown après abandon en MATCH (inchangé)
 # Cooldown progressif pour quitter la QUEUE (pas le match)
