@@ -328,6 +328,10 @@ def init_db():
                 cosmetic_id  INTEGER NOT NULL,
                 expires_at   TEXT NOT NULL,
                 PRIMARY KEY (player_id, cosmetic_id)
+            )""",
+        """CREATE TABLE IF NOT EXISTS bot_config (
+                key   TEXT PRIMARY KEY,
+                value TEXT
             )"""
     ]:
         try:
@@ -441,6 +445,21 @@ def init_db():
             )
     conn2.commit()
     conn2.close()
+
+
+def config_get(key: str) -> "str | None":
+    """Lit une valeur dans bot_config."""
+    conn = get_db()
+    row = conn.execute("SELECT value FROM bot_config WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else None
+
+def config_set(key: str, value: str):
+    """Écrit une valeur dans bot_config."""
+    conn = get_db()
+    conn.execute("INSERT OR REPLACE INTO bot_config (key, value) VALUES (?,?)", (key, value))
+    conn.commit()
+    conn.close()
 
 def get_current_season() -> int:
     conn = get_db()
@@ -691,7 +710,7 @@ class ApplicationReviewView(discord.ui.View):
                 try:
                     dm_embed = discord.Embed(
                         title="🎉 Candidature acceptée !",
-                        description=f"Bienvenue sur **Crazy Inhouse** ! Tu as maintenant accès au serveur.\n\nUtilise `/register` dans ton salon privé pour créer ton profil et commencer à jouer !",
+                        description=f"Bienvenue sur **Crazy Inhouse** ! Tu as maintenant accès au serveur.\n\nUtilise `/register` dans le salon 📝︎​​commandes pour créer ton profil et commencer à jouer !",
                         color=0x3ba55d
                     )
                     await member.send(embed=dm_embed)
@@ -1823,23 +1842,27 @@ class MatchResultView(discord.ui.View):
             return
 
         votes[this_team].add(uid)
+        count = len(votes[this_team])
+
+        # Seuil atteint → ouvrir le modal DIRECTEMENT comme première réponse
+        # (un modal ne peut pas être un followup, il doit être interaction.response)
+        if count >= VOTE_THRESHOLD:
+            await self._finalize_by_vote(interaction, team, auto=False)
+            return
+
+        # Pas encore atteint : confirmer le vote normalement
         t1 = len(votes["team1"])
         t2 = len(votes["team2"])
-
         await interaction.response.send_message(
             f"✅ Vote enregistré pour **Team {team}** ! ({t1 if team==1 else t2}/6)", ephemeral=True
         )
         await self._update_vote_embed(interaction, votes)
 
-        # Seuil atteint ?
-        if len(votes[this_team]) >= VOTE_THRESHOLD:
-            await self._finalize_by_vote(interaction, team, auto=False)
-        else:
-            # Lancer le timeout si pas encore fait
-            if votes["timeout_task"] is None:
-                votes["timeout_task"] = asyncio.create_task(
-                    self._vote_timeout(interaction.guild, interaction.channel, mid)
-                )
+        # Lancer le timeout si pas encore fait
+        if votes["timeout_task"] is None:
+            votes["timeout_task"] = asyncio.create_task(
+                self._vote_timeout(interaction.guild, interaction.channel, mid)
+            )
 
     async def _update_vote_embed(self, interaction, votes):
         try:
@@ -1875,11 +1898,8 @@ class MatchResultView(discord.ui.View):
         votes["team2"].clear()
 
         if not auto:
-            await interaction.followup.send(
-                f"🗳️ **6 votes atteints !** Team {winner} gagne.\nEntre le score pour finaliser :",
-                ephemeral=True
-            )
-            await interaction.followup.send_modal(ScoreModal(self.match_id, winner))
+            # Le modal doit être la réponse directe à l'interaction (pas un followup)
+            await interaction.response.send_modal(ScoreModal(self.match_id, winner))
 
     @discord.ui.button(label="✅ Team 1 a gagné", style=discord.ButtonStyle.success, custom_id="vote_team1")
     async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2693,29 +2713,28 @@ async def update_stats_counter(guild: discord.Guild):
             everyone: discord.PermissionOverwrite(view_channel=True, connect=False)
         })
 
+    ow_stats = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
+    }
+
     # Salon matchs joués
-    vc_matches = discord.utils.get(guild.voice_channels, name__startswith="🎮 Matchs joués")
     new_name_m = f"🎮 Matchs joués : {total}"
+    vc_matches = next((vc for vc in guild.voice_channels if vc.name.startswith("🎮 Matchs joués")), None)
     if vc_matches:
         if vc_matches.name != new_name_m:
             await vc_matches.edit(name=new_name_m)
     else:
-        await guild.create_voice_channel(new_name_m, category=cat, overwrites={
-            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
-        })
+        await guild.create_voice_channel(new_name_m, category=cat, overwrites=ow_stats)
 
     # Salon joueurs inscrits
-    vc_players = discord.utils.get(guild.voice_channels, name__startswith="👥 Joueurs inscrits")
     new_name_p = f"👥 Joueurs inscrits : {players}"
+    vc_players = next((vc for vc in guild.voice_channels if vc.name.startswith("👥 Joueurs inscrits")), None)
     if vc_players:
         if vc_players.name != new_name_p:
             await vc_players.edit(name=new_name_p)
     else:
-        await guild.create_voice_channel(new_name_p, category=cat, overwrites={
-            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
-        })
+        await guild.create_voice_channel(new_name_p, category=cat, overwrites=ow_stats)
 
 
 async def update_leaderboard(guild: discord.Guild):
@@ -2971,13 +2990,13 @@ async def fill_channels_cmd(interaction: discord.Interaction):
     ch_faq = next((c for c in guild.text_channels if "faq" in c.name), None)
     if ch_faq:
         ef = discord.Embed(title="\u2753 Questions fr\u00e9quentes", color=0xff4655)
-        ef.add_field(name="Comment s'inscrire ?", value="Poste ta candidature dans \U0001f39f\ufe0f\ufe0f\ufe0e\ufe0f\u200b\u200b\u200bcandidat\u200bures. Un admin la validera. Une fois accept\u00e9, utilise `/register` dans ton salon priv\u00e9.", inline=False)
-        ef.add_field(name="Comment rejoindre une queue ?", value="Va dans ton salon priv\u00e9 \U0001f3ae\ufe0f\u200b\u200bqueue et clique sur ton r\u00f4le. D\u00e8s que 10 joueurs sont pr\u00eats, le match se lance automatiquement.", inline=False)
+        ef.add_field(name="Comment s'inscrire ?", value="Poste ta candidature dans \U0001f39f\ufe0f\ufe0f\ufe0e\ufe0f\u200b\u200b\u200bcandidat\u200bures. Un admin la validera. Une fois accept\u00e9, utilise `/register` dans le salon 📝︎​​commandes.", inline=False)
+        ef.add_field(name="Comment rejoindre une queue ?", value="Va dans le salon 🎮︎​​queue correspondant à ton niveau et clique sur ton rôle. Dès que 10 joueurs sont prêts, le match se lance automatiquement.", inline=False)
         ef.add_field(name="C'est quoi les diff\u00e9rentes queues ?", value="\U0001f451 **Radiant / Immo3** \u2014 niveau pro / ex-pro / top radiant\n\U0001f48e **Ascendant / Immo3** \u2014 niveau haut pour un cadre plus s\u00e9rieux\n\U0001f338 **Game Changers** \u2014 r\u00e9serv\u00e9e aux joueuses", inline=False)
         ef.add_field(name="Comment est calcul\u00e9 l'ELO ?", value="Base 1000 pts. +/- selon r\u00e9sultat, ELO moyen des \u00e9quipes et MVP. Les 10 premi\u00e8res parties sont des placements (ELO masqu\u00e9).", inline=False)
         ef.add_field(name="Score contest\u00e9 ?", value="Contacte un admin dans le salon de match. Le screenshot du scoreboard fait foi.", inline=False)
         ef.add_field(name="Abandon involontaire ?", value="Contacte un admin. Les abandons involontaires (crash, urgence) peuvent \u00eatre excus\u00e9s si signal\u00e9s rapidement.", inline=False)
-        ef.add_field(name="Voir mes stats ?", value="Ton salon priv\u00e9 \U0001f4ca\ufe0f\u200b\u200bprofil est mis \u00e0 jour apr\u00e8s chaque match. Tu peux aussi utiliser `/stats`.", inline=False)
+        ef.add_field(name="Voir mes stats ?", value="Utilise `/rank` ou `/stats` pour voir tes statistiques et ton historique de matchs.", inline=False)
         await clear_and_post(ch_faq, [ef])
 
     # #annonces
@@ -3065,7 +3084,7 @@ async def valider_cmd(interaction: discord.Interaction, user: discord.Member):
     try:
         await user.send(embed=discord.Embed(
             title="🎉 Candidature acceptée !",
-            description="Bienvenue sur **Crazy Inhouse** ! Tu as maintenant accès au serveur.\nUtilise `/register` dans ton salon privé pour créer ton profil !",
+            description="Bienvenue sur **Crazy Inhouse** ! Tu as maintenant accès au serveur.\nUtilise `/register` dans le salon 📝︎​​commandes pour créer ton profil !",
             color=0x3ba55d
         ))
     except Exception:
@@ -3956,6 +3975,174 @@ async def boutique_cmd(interaction: discord.Interaction, type: str = "fixed"):
     uid = str(interaction.user.id)
     embed = build_shop_embed(rotating=(type == "rotating"), uid=uid)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ─────────────────────────────────────────────
+#  SALON BOUTIQUE — embeds persistants
+# ─────────────────────────────────────────────
+def build_rotating_shop_channel_embed() -> discord.Embed:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM cosmetics WHERE is_rotating=1 AND active=1 "
+        "AND available_until IS NOT NULL AND available_until > datetime('now') "
+        "ORDER BY type, price"
+    ).fetchall()
+    conn.close()
+
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    reset_ts = int(tomorrow.timestamp())
+
+    embed = discord.Embed(
+        title="🔄 Boutique Rotative — Offres du Jour",
+        description=(
+            f"Ces articles exclusifs sont disponibles jusqu'à <t:{reset_ts}:t>.\n"
+            f"La boutique se renouvelle dans <t:{reset_ts}:R>.\n\n"
+            "💡 **`/acheter <id>`** pour acheter"
+        ),
+        color=0xff9900
+    )
+
+    if not rows:
+        embed.add_field(name="Aucune offre disponible",
+                        value="La boutique rotative sera mise à jour bientôt.", inline=False)
+        embed.set_footer(text="Reviens demain pour de nouveaux articles !")
+        return embed
+
+    type_labels = {"role": "🎨 Rôles colorés", "badge": "🏅 Badges", "prefix": "✨ Préfixes"}
+    by_type: dict = {}
+    for r in rows:
+        by_type.setdefault(r["type"], []).append(r)
+
+    for t, items in by_type.items():
+        lines = []
+        for item in items:
+            icon = item["emoji"] or "🎁"
+            desc = f" — *{item['description']}*" if item["description"] else ""
+            lines.append(f"`#{item['id']}` {icon} **{item['name']}**{desc} · **{item['price']} pts**")
+        embed.add_field(name=type_labels.get(t, t), value="\n".join(lines), inline=False)
+
+    embed.set_footer(text="Renouvellement chaque jour à minuit UTC • Les articles non achetés disparaissent !")
+    return embed
+
+
+async def update_shop_channel_embed(guild: discord.Guild = None):
+    channel_id = config_get("shop_channel_id")
+    msg_id = config_get("shop_rotating_msg_id")
+    if not channel_id or not msg_id:
+        return
+    if guild is None:
+        guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+    ch = guild.get_channel(int(channel_id))
+    if not ch:
+        return
+    try:
+        msg = await ch.fetch_message(int(msg_id))
+        await msg.edit(embed=build_rotating_shop_channel_embed())
+        print("[SHOP] Embed rotatif mis a jour")
+    except Exception as e:
+        print(f"[SHOP] Erreur update embed: {e}")
+
+
+@tree.command(name="setupboutique", description="[ADMIN] Creer/mettre a jour le salon boutique")
+async def setupboutique_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    me = guild.me
+
+    role_membre = discord.utils.get(guild.roles, name="Membre")
+    role_admin  = discord.utils.get(guild.roles, name="Admin")
+
+    ow_boutique = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                         manage_messages=True, read_message_history=True),
+    }
+    if role_membre:
+        ow_boutique[role_membre] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=False,
+            read_message_history=True, use_application_commands=True)
+    if role_admin:
+        ow_boutique[role_admin] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True,
+            manage_messages=True, read_message_history=True)
+
+    cat = discord.utils.get(guild.categories, name="💬 GÉNÉRAL")
+    ch = discord.utils.get(guild.text_channels, name="🛒︱boutique")
+    if not ch:
+        ch = await guild.create_text_channel(
+            "🛒︱boutique", category=cat, overwrites=ow_boutique,
+            topic="Boutique de cosmetiques • Gagne des points en jouant !")
+
+    # Embed 1 : Boutique fixe
+    embed_fixed = build_shop_embed(rotating=False)
+    embed_fixed.title = "🛒 Boutique Permanente"
+    embed_fixed.description = (
+        "Ces articles sont **toujours disponibles** et ne disparaissent jamais.\n\n"
+        "💰 **Gagne des points en jouant :**\n"
+        "• +15 pts par victoire\n"
+        "• +5 pts par defaite\n"
+        "• +5 pts bonus MVP\n\n"
+        "💡 **`/acheter <id>`** pour acheter · **`/mescosmétiques`** pour voir tes articles"
+    )
+    embed_fixed.color = 0x6553e8
+    embed_fixed.set_footer(text="Les articles achetes sont permanents !")
+
+    # Embed 2 : Boutique rotative
+    embed_rotating = build_rotating_shop_channel_embed()
+
+    saved_ch_id  = config_get("shop_channel_id")
+    saved_fix_id = config_get("shop_fixed_msg_id")
+    saved_rot_id = config_get("shop_rotating_msg_id")
+
+    fixed_msg = rotating_msg = None
+
+    if saved_ch_id and saved_fix_id:
+        try:
+            ch_old = guild.get_channel(int(saved_ch_id))
+            if ch_old:
+                fixed_msg = await ch_old.fetch_message(int(saved_fix_id))
+                await fixed_msg.edit(embed=embed_fixed)
+        except Exception:
+            fixed_msg = None
+
+    if not fixed_msg:
+        fixed_msg = await ch.send(embed=embed_fixed)
+        config_set("shop_fixed_msg_id", str(fixed_msg.id))
+
+    if saved_ch_id and saved_rot_id:
+        try:
+            ch_old = guild.get_channel(int(saved_ch_id))
+            if ch_old:
+                rotating_msg = await ch_old.fetch_message(int(saved_rot_id))
+                await rotating_msg.edit(embed=embed_rotating)
+        except Exception:
+            rotating_msg = None
+
+    if not rotating_msg:
+        rotating_msg = await ch.send(embed=embed_rotating)
+        config_set("shop_rotating_msg_id", str(rotating_msg.id))
+
+    config_set("shop_channel_id", str(ch.id))
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title="✅ Salon boutique configuré !",
+            description=(
+                f"Les embeds ont ete postes dans {ch.mention}\n\n"
+                "• **Embed fixe** — articles permanents\n"
+                "• **Embed rotatif** — 5 articles du jour, refresh chaque nuit a minuit\n\n"
+                "Lance `/setupboutique` a nouveau pour forcer une mise a jour."
+            ),
+            color=0x3ba55d
+        ), ephemeral=True
+    )
+
 
 
 @tree.command(name="acheter", description="Acheter un cosmétique avec tes points")
@@ -5048,6 +5235,8 @@ async def daily_shop_rotation():
         return
     rotate_shop()
     print("[SHOP] Rotation quotidienne effectuée")
+    # Mettre à jour l'embed dans le salon boutique
+    await update_shop_channel_embed()
 
 
 def rotate_shop():
