@@ -94,7 +94,7 @@ QUEUES = {
 # État des pings par queue — anti-spam
 # first_at/mid_at = datetime du dernier ping, None si pas encore envoyé
 PING_COOLDOWN_MINUTES = 10  # délai minimum entre deux sessions de ping
-queue_ping_state: dict = {qid: {"first_at": None, "mid": False} for qid in ["radiant", "ascendant", "gamechangers", "immortal", "test"]}
+queue_ping_state: dict = {qid: {"first_at": None, "mid": False} for qid in QUEUES}
 
 # Joueurs qui ont reçu le DM de warning timeout mais n'ont pas encore répondu
 # {uid: datetime_du_warning}
@@ -4122,7 +4122,7 @@ async def test_mode_cmd(interaction: discord.Interaction, players: int = 2):
 @tree.command(name="fillqueue", description="[ADMIN] Remplir une queue avec des joueurs fictifs pour tester")
 @app_commands.describe(queue="Queue à remplir")
 @app_commands.choices(queue=[
-    app_commands.Choice(name=QUEUES[qid]["name"], value=qid) for qid in QUEUES if not QUEUES[qid].get("test_only")
+    app_commands.Choice(name=QUEUES[qid]["name"], value=qid) for qid in QUEUES
 ])
 async def fill_queue_cmd(interaction: discord.Interaction, queue: str = None):
     if not interaction.user.guild_permissions.administrator:
