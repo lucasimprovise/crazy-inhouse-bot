@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+HENRIK_API_KEY = os.getenv("HENRIK_API_KEY", "")
+RIOT_REGION = os.getenv("RIOT_REGION", "eu")  # eu, na, ap, kr, latam, br
 GUILD_ID = int(os.getenv("GUILD_ID", 0))
 
 # ─────────────────────────────────────────────
@@ -35,6 +37,9 @@ ABANDON_COOLDOWN   = 15     # minutes de cooldown après abandon en MATCH (incha
 # Cooldown progressif pour quitter la QUEUE (pas le match)
 QUEUE_LEAVE_COOLDOWNS = [0, 0, 1, 3, 10, 20]  # 0 leave: 0min, 1: 0min, 2: 1min, 3: 3min, 4: 10min, 5+: 20min
 REPORT_THRESHOLD   = 3      # nb de reports pour alerter les admins
+POINTS_WIN         = 15     # points gagnés par victoire
+POINTS_LOSS        = 5      # points gagnés par défaite
+POINTS_MVP         = 5      # bonus MVP
 
 # ── Multi-Queue Config ──────────────────────────────────────────────
 QUEUES = {
@@ -71,6 +76,10 @@ QUEUES = {
 # first_at/mid_at = datetime du dernier ping, None si pas encore envoyé
 PING_COOLDOWN_MINUTES = 10  # délai minimum entre deux sessions de ping
 queue_ping_state: dict = {qid: {"first_at": None, "mid": False} for qid in ["radiant", "ascendant", "gamechangers"]}
+
+# Joueurs qui ont reçu le DM de warning timeout mais n'ont pas encore répondu
+# {uid: datetime_du_warning}
+queue_timeout_warned: dict = {}
 
 VALORANT_MAPS = [
     "Abyss", "Ascent", "Bind", "Breeze", "Fracture",
@@ -209,12 +218,40 @@ def init_db():
             notifs_channel  INTEGER,
             history_channel INTEGER
         );
+        CREATE TABLE IF NOT EXISTS follows (
+            follower_id  TEXT NOT NULL,
+            followed_id  TEXT NOT NULL,
+            PRIMARY KEY (follower_id, followed_id)
+        );
+        CREATE TABLE IF NOT EXISTS cosmetics (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL,
+            type         TEXT NOT NULL,  -- 'role', 'badge', 'prefix'
+            description  TEXT,
+            price        INTEGER NOT NULL,
+            role_color   INTEGER DEFAULT NULL,  -- hex color pour type=role
+            emoji        TEXT DEFAULT NULL,     -- emoji pour badge/prefix
+            is_rotating  INTEGER DEFAULT 0,
+            available_until TEXT DEFAULT NULL,
+            active       INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS player_cosmetics (
+            player_id    TEXT NOT NULL,
+            cosmetic_id  INTEGER NOT NULL,
+            equipped     INTEGER DEFAULT 0,
+            bought_at    TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (player_id, cosmetic_id)
+        );
     """)
     conn.commit()
 
     # Migrations sécurisées — ignorées si la colonne existe déjà
     migrations = [
         "ALTER TABLE players ADD COLUMN riot_id TEXT DEFAULT NULL",
+        "ALTER TABLE players ADD COLUMN points INTEGER DEFAULT 0",
+        "ALTER TABLE players ADD COLUMN val_rank TEXT DEFAULT NULL",
+        "ALTER TABLE players ADD COLUMN val_elo INTEGER DEFAULT NULL",
+        "ALTER TABLE players ADD COLUMN val_rank_updated TEXT DEFAULT NULL",
         "ALTER TABLE player_channels ADD COLUMN queue_message_id INTEGER DEFAULT NULL",
         "ALTER TABLE players ADD COLUMN streak INTEGER DEFAULT 0",
         "ALTER TABLE players ADD COLUMN best_streak INTEGER DEFAULT 0",
@@ -644,13 +681,77 @@ async def sync_rank_role(guild: discord.Guild, member: discord.Member, elo: int)
 # ─────────────────────────────────────────────
 #  TEAM BALANCING
 # ─────────────────────────────────────────────
+
+# Rang Valorant → ELO approximatif pour l'équilibrage
+VAL_TIER_ELO = {
+    "Iron 1": 100, "Iron 2": 133, "Iron 3": 166,
+    "Bronze 1": 200, "Bronze 2": 233, "Bronze 3": 266,
+    "Silver 1": 300, "Silver 2": 333, "Silver 3": 366,
+    "Gold 1": 400, "Gold 2": 433, "Gold 3": 466,
+    "Platinum 1": 500, "Platinum 2": 533, "Platinum 3": 566,
+    "Diamond 1": 600, "Diamond 2": 633, "Diamond 3": 666,
+    "Ascendant 1": 700, "Ascendant 2": 733, "Ascendant 3": 766,
+    "Immortal 1": 800, "Immortal 2": 833, "Immortal 3": 866,
+    "Radiant": 1000,
+}
+
+async def fetch_riot_rank(riot_id: str) -> dict | None:
+    """Récupère le rang actuel d'un joueur via l'API Henrik3.
+    Retourne {"tier": "Diamond 1", "rr": 38, "elo": 1538} ou None si erreur."""
+    if not HENRIK_API_KEY or "#" not in riot_id:
+        return None
+    name, tag = riot_id.split("#", 1)
+    url = f"https://api.henrikdev.xyz/valorant/v3/mmr/{RIOT_REGION}/pc/{name}/{tag}"
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers={"Authorization": HENRIK_API_KEY}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    print(f"[RIOT API] {resp.status} pour {riot_id}")
+                    return None
+                data = await resp.json()
+                current = data.get("data", {}).get("current", {})
+                tier_name = current.get("tier", {}).get("name")
+                rr = current.get("rr", 0)
+                elo = current.get("elo", 0)
+                if not tier_name:
+                    return None
+                return {"tier": tier_name, "rr": rr, "elo": elo}
+    except Exception as e:
+        print(f"[RIOT API] Erreur fetch {riot_id}: {e}")
+        return None
+
+
+async def sync_player_rank(uid: str, riot_id: str, conn=None) -> dict | None:
+    """Sync le rang Riot d'un joueur et le stocke en BDD."""
+    rank_data = await fetch_riot_rank(riot_id)
+    if not rank_data:
+        return None
+    close = conn is None
+    if conn is None:
+        conn = get_db()
+    conn.execute(
+        "UPDATE players SET val_rank=?, val_elo=?, val_rank_updated=datetime('now') WHERE discord_id=?",
+        (rank_data["tier"], rank_data["elo"], uid)
+    )
+    conn.commit()
+    if close:
+        conn.close()
+    return rank_data
+
 def balance_teams(players: list[dict]) -> tuple[list, list]:
     from itertools import combinations
     conn = get_db()
     elos = {}
     for p in players:
-        row = conn.execute("SELECT elo FROM players WHERE discord_id = ?", (p["id"],)).fetchone()
-        elos[p["id"]] = row["elo"] if row else 1000
+        row = conn.execute("SELECT elo, val_elo FROM players WHERE discord_id = ?", (p["id"],)).fetchone()
+        internal_elo = row["elo"] if row else 1000
+        # Si on a un rang Riot vérifié, on mixe les deux (60% interne + 40% Riot)
+        if row and row["val_elo"]:
+            val_elo_normalized = row["val_elo"] / 2.0  # val_elo va jusqu'à ~2000+, on normalise
+            elos[p["id"]] = round(internal_elo * 0.6 + val_elo_normalized * 0.4)
+        else:
+            elos[p["id"]] = internal_elo
     conn.close()
 
     best_diff = float("inf")
@@ -817,6 +918,7 @@ async def _init_profil_channel(channel: discord.TextChannel, member: discord.Mem
         else:
             embed.add_field(name="Rang", value=f"{ricon} **{rname}**", inline=True)
             embed.add_field(name="ELO", value=f"**{row['elo']}** pts", inline=True)
+        embed.add_field(name="💰 Points boutique", value=f"**{row['points'] or 0}** pts", inline=True)
         embed.add_field(name="Record", value=f"**{row['wins']}W / {row['losses']}L** ({wr}%)", inline=True)
         embed.add_field(name="Streak", value=f"🔥 {row['streak']} (record: {row['best_streak']})", inline=True)
         embed.add_field(name="MVP", value=f"🌟 {row['mvp_count']}", inline=True)
@@ -867,6 +969,7 @@ async def update_player_profil(guild: discord.Guild, uid: str):
     else:
         embed.add_field(name="Rang", value=f"{ricon} **{rname}**", inline=True)
         embed.add_field(name="ELO", value=f"**{row['elo']}** pts", inline=True)
+        embed.add_field(name="💰 Points boutique", value=f"**{row['points'] or 0}** pts", inline=True)
     embed.add_field(name="Record", value=f"**{row['wins']}W / {row['losses']}L** ({wr}%)", inline=True)
     embed.add_field(name="Streak", value=f"🔥 {row['streak']} (record: {row['best_streak']})", inline=True)
     embed.add_field(name="MVP", value=f"🌟 {row['mvp_count']}", inline=True)
@@ -1263,6 +1366,9 @@ async def _join_queue(interaction: discord.Interaction, uid: str, username: str,
     # Ping les joueurs qui ont les notifs activées (sauf celui qui vient de rejoindre)
     await ping_queue_watchers(interaction.guild, uid, username, queue_id, nb, current_size)
 
+    # Notifier les followers
+    await notify_followers(interaction.guild, uid, username, queue_id)
+
     if nb >= current_size:
         # Reset complet au match lancé — prochaine session peut pinger immédiatement
         queue_ping_state[queue_id] = {"first_at": None, "mid": False}
@@ -1447,7 +1553,7 @@ class MVPSelect(discord.ui.Select):
             mvp_player = next((p for p in self.all_players if p["id"] == mvp_id), None)
             if mvp_player:
                 conn = get_db()
-                conn.execute("UPDATE players SET mvp_count = mvp_count + 1 WHERE discord_id = ?", (mvp_id,))
+                conn.execute("UPDATE players SET mvp_count = mvp_count + 1, points=COALESCE(points,0)+? WHERE discord_id = ?", (POINTS_MVP, mvp_id,))
                 conn.execute("UPDATE matches SET mvp = ? WHERE match_id = ?", (mvp_id, self.match_id))
                 conn.commit()
                 conn.close()
@@ -2024,7 +2130,7 @@ async def finalize_match(interaction: discord.Interaction, match_id: str, winner
         update_queue_elo(p["id"], queue_id, conn=conn, elo=new_elo, wins=prow["wins"]+1,
                          streak=new_streak, best_streak=new_best, placement_done=placement_done)
         # Aussi mettre à jour l'ELO global pour le leaderboard/rang
-        conn.execute("UPDATE players SET elo=?, wins=wins+1 WHERE discord_id=?", (new_elo, p["id"]))
+        conn.execute("UPDATE players SET elo=?, wins=wins+1, points=COALESCE(points,0)+? WHERE discord_id=?", (new_elo, POINTS_WIN, p["id"]))
         in_place = is_in_placement(prow["wins"], prow["losses"])
         elo_changes[p["id"]] = {"old": old_elo, "new": new_elo, "change": f"+{gain}", "placement": in_place, "k": k, "streak": new_streak, "new_best": new_streak == new_best and new_streak >= 3}
 
@@ -2039,7 +2145,7 @@ async def finalize_match(interaction: discord.Interaction, match_id: str, winner
         placement_done = 1 if total_after >= PLACEMENT_MATCHES else 0
         update_queue_elo(p["id"], queue_id, conn=conn, elo=new_elo, losses=prow["losses"]+1,
                          streak=0, placement_done=placement_done)
-        conn.execute("UPDATE players SET elo=?, losses=losses+1, streak=0 WHERE discord_id=?", (new_elo, p["id"]))
+        conn.execute("UPDATE players SET elo=?, losses=losses+1, streak=0, points=COALESCE(points,0)+? WHERE discord_id=?", (new_elo, POINTS_LOSS, p["id"]))
         in_place = is_in_placement(prow["wins"], prow["losses"])
         elo_changes[p["id"]] = {"old": old_elo, "new": new_elo, "change": f"-{loss}", "placement": in_place, "k": k}
 
@@ -2331,11 +2437,43 @@ async def set_riot(interaction: discord.Interaction, riot_id: str):
         await interaction.response.send_message("❌ Format invalide ! Exemple : `MonPseudo#EUW`", ephemeral=True)
         return
     uid = str(interaction.user.id)
+    await interaction.response.defer(ephemeral=True)
     conn = get_db()
     conn.execute("UPDATE players SET riot_id=? WHERE discord_id=?", (riot_id, uid))
     conn.commit()
     conn.close()
-    await interaction.response.send_message(f"✅ Compte Riot lié : **{riot_id}**", ephemeral=True)
+    rank_data = await sync_player_rank(uid, riot_id)
+    if rank_data:
+        await interaction.followup.send(
+            f"✅ Compte Riot lié : **{riot_id}**\n🎯 Rang actuel : **{rank_data['tier']}** ({rank_data['rr']} RR)",
+            ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            f"✅ Compte Riot lié : **{riot_id}**\n⚠️ Rang non récupéré (vérifie le format ou réessaie plus tard).",
+            ephemeral=True
+        )
+
+
+
+@tree.command(name="syncrank", description="Synchroniser ton rang Riot manuellement")
+async def syncrank_cmd(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    conn = get_db()
+    row = conn.execute("SELECT riot_id FROM players WHERE discord_id=?", (uid,)).fetchone()
+    conn.close()
+    if not row or not row["riot_id"]:
+        await interaction.response.send_message("❌ Aucun compte Riot lié. Utilise `/setriot` d'abord.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    rank_data = await sync_player_rank(uid, row["riot_id"])
+    if rank_data:
+        await interaction.followup.send(
+            f"✅ Rang mis à jour : **{rank_data['tier']}** ({rank_data['rr']} RR)",
+            ephemeral=True
+        )
+    else:
+        await interaction.followup.send("❌ Impossible de récupérer le rang. Réessaie plus tard.", ephemeral=True)
 
 
 @tree.command(name="rank", description="Voir ses stats et son rang")
@@ -2360,7 +2498,10 @@ async def rank_cmd(interaction: discord.Interaction, user: discord.Member = None
     in_placement = is_in_placement(row["wins"], row["losses"])
     place_progress = placement_progress(row["wins"], row["losses"])
 
-    embed = discord.Embed(title=f"📊 Stats de {target.display_name}", color=0x5865f2 if in_placement else color)
+    prefix = get_player_prefix(uid)
+    badges = get_player_badges(uid)
+    title_name = f"{prefix}{target.display_name}" + (f" {badges}" if badges else "")
+    embed = discord.Embed(title=f"📊 Stats de {title_name}", color=0x5865f2 if in_placement else color)
     embed.set_thumbnail(url=target.display_avatar.url)
 
     if in_placement:
@@ -2378,8 +2519,12 @@ async def rank_cmd(interaction: discord.Interaction, user: discord.Member = None
     embed.add_field(name="Streak actuel",   value=f"🔥 **{row['streak']}**",       inline=True)
     embed.add_field(name="Meilleur streak", value=f"🏅 **{row['best_streak']}**",  inline=True)
     embed.add_field(name="MVP",             value=f"🌟 **{row['mvp_count']}**",    inline=True)
+    embed.add_field(name="💰 Points",       value=f"**{row['points'] or 0}** pts", inline=True)
     if row["riot_id"]:
-        embed.add_field(name="Compte Riot", value=f"`{row['riot_id']}`",           inline=False)
+        riot_val = f"`{row['riot_id']}`"
+        if row.get("val_rank"):
+            riot_val += f"\n🎯 **{row['val_rank']}**"
+        embed.add_field(name="Compte Riot", value=riot_val, inline=False)
 
     if in_placement:
         embed.set_footer(text=f"🔰 Matchs de placement : {place_progress} • Saison {get_current_season()} • K={K_FACTOR_PLACEMENT}")
@@ -3132,6 +3277,401 @@ async def setup_spaces_cmd(interaction: discord.Interaction):
     )
 
 
+
+# ─────────────────────────────────────────────
+#  HELPERS COSMÉTIQUES
+# ─────────────────────────────────────────────
+
+def get_player_prefix(uid: str) -> str:
+    """Retourne le préfixe équipé du joueur, ou chaîne vide."""
+    conn = get_db()
+    row = conn.execute("""
+        SELECT c.emoji FROM cosmetics c
+        JOIN player_cosmetics pc ON pc.cosmetic_id = c.id
+        WHERE pc.player_id=? AND pc.equipped=1 AND c.type='prefix'
+    """, (uid,)).fetchone()
+    conn.close()
+    return (row["emoji"] + " ") if row else ""
+
+
+def get_player_badges(uid: str) -> str:
+    """Retourne les badges équipés du joueur sous forme de string."""
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT c.emoji FROM cosmetics c
+        JOIN player_cosmetics pc ON pc.cosmetic_id = c.id
+        WHERE pc.player_id=? AND pc.equipped=1 AND c.type='badge'
+        ORDER BY pc.bought_at
+    """, (uid,)).fetchall()
+    conn.close()
+    return " ".join(r["emoji"] for r in rows) if rows else ""
+
+
+def build_shop_embed(rotating: bool = False) -> discord.Embed:
+    """Construit l'embed de la boutique."""
+    conn = get_db()
+    if rotating:
+        rows = conn.execute("""
+            SELECT * FROM cosmetics WHERE active=1 AND is_rotating=1
+            AND (available_until IS NULL OR available_until > datetime('now'))
+            ORDER BY price
+        """).fetchall()
+        title = "🔄 Boutique Rotative"
+        color = 0xff9900
+    else:
+        rows = conn.execute("""
+            SELECT * FROM cosmetics WHERE active=1 AND is_rotating=0
+            ORDER BY type, price
+        """).fetchall()
+        title = "🛒 Boutique"
+        color = 0x6553e8
+    conn.close()
+
+    embed = discord.Embed(title=title, color=color)
+    if not rows:
+        embed.description = "Aucun article disponible pour l'instant."
+        return embed
+
+    type_labels = {"role": "🎨 Rôles colorés", "badge": "🏅 Badges", "prefix": "✨ Préfixes"}
+    by_type: dict = {}
+    for r in rows:
+        t = r["type"]
+        by_type.setdefault(t, []).append(r)
+
+    for t, items in by_type.items():
+        lines = []
+        for item in items:
+            icon = item["emoji"] or ""
+            lines.append(f"`#{item['id']}` {icon} **{item['name']}** — **{item['price']} pts**\n*{item['description'] or ''}*")
+        embed.add_field(name=type_labels.get(t, t), value="\n".join(lines), inline=False)
+
+    embed.set_footer(text="Utilise /acheter <id> pour acheter • /equiper <id> pour équiper")
+    return embed
+
+
+@tree.command(name="boutique", description="Voir la boutique des cosmétiques")
+@app_commands.describe(type="Type de boutique")
+@app_commands.choices(type=[
+    app_commands.Choice(name="Boutique fixe", value="fixed"),
+    app_commands.Choice(name="Boutique rotative", value="rotating"),
+])
+async def boutique_cmd(interaction: discord.Interaction, type: str = "fixed"):
+    embed = build_shop_embed(rotating=(type == "rotating"))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="acheter", description="Acheter un cosmétique avec tes points")
+@app_commands.describe(id="ID de l'article (visible dans /boutique)")
+async def acheter_cmd(interaction: discord.Interaction, id: int):
+    uid = str(interaction.user.id)
+    conn = get_db()
+
+    # Vérif article
+    item = conn.execute("SELECT * FROM cosmetics WHERE id=? AND active=1", (id,)).fetchone()
+    if not item:
+        conn.close()
+        await interaction.response.send_message("❌ Article introuvable.", ephemeral=True)
+        return
+
+    # Vérif article rotatif encore dispo
+    if item["is_rotating"] and item["available_until"]:
+        from datetime import datetime as dt
+        if dt.fromisoformat(item["available_until"]) < dt.now():
+            conn.close()
+            await interaction.response.send_message("❌ Cette offre rotative n'est plus disponible.", ephemeral=True)
+            return
+
+    # Vérif déjà possédé
+    owned = conn.execute("SELECT 1 FROM player_cosmetics WHERE player_id=? AND cosmetic_id=?", (uid, id)).fetchone()
+    if owned:
+        conn.close()
+        await interaction.response.send_message("⚠️ Tu possèdes déjà cet article !", ephemeral=True)
+        return
+
+    # Vérif points
+    player = conn.execute("SELECT points FROM players WHERE discord_id=?", (uid,)).fetchone()
+    if not player:
+        conn.close()
+        await interaction.response.send_message("❌ Tu n'es pas inscrit ! Utilise `/register`.", ephemeral=True)
+        return
+    if (player["points"] or 0) < item["price"]:
+        conn.close()
+        await interaction.response.send_message(
+            f"❌ Pas assez de points ! Il te faut **{item['price']} pts** (tu as **{player['points'] or 0} pts**).",
+            ephemeral=True
+        )
+        return
+
+    # Achat
+    conn.execute("UPDATE players SET points=points-? WHERE discord_id=?", (item["price"], uid))
+    conn.execute("INSERT INTO player_cosmetics (player_id, cosmetic_id) VALUES (?,?)", (uid, id))
+    conn.commit()
+
+    # Si c'est un rôle, l'attribuer sur Discord
+    if item["type"] == "role" and item["role_color"]:
+        role_name = f"✨ {item['name']}"
+        role = discord.utils.get(interaction.guild.roles, name=role_name)
+        if not role:
+            role = await interaction.guild.create_role(
+                name=role_name,
+                color=discord.Color(item["role_color"]),
+                hoist=False
+            )
+        await interaction.user.add_roles(role)
+        # Sauvegarder le role_id
+        conn.execute("UPDATE cosmetics SET role_color=? WHERE id=?", (item["role_color"], id))
+        conn.commit()
+
+    conn.close()
+
+    icon = item["emoji"] or ""
+    new_pts = (player["points"] or 0) - item["price"]
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title=f"✅ Achat réussi !",
+            description=f"{icon} **{item['name']}** acheté pour **{item['price']} pts**\nIl te reste **{new_pts} pts**\n\nUtilise `/equiper {id}` pour l'activer !",
+            color=0x00ff88
+        ),
+        ephemeral=True
+    )
+
+
+@tree.command(name="equiper", description="Équiper ou déséquiper un cosmétique")
+@app_commands.describe(id="ID du cosmétique à équiper/déséquiper")
+async def equiper_cmd(interaction: discord.Interaction, id: int):
+    uid = str(interaction.user.id)
+    conn = get_db()
+
+    owned = conn.execute(
+        "SELECT pc.equipped, c.type, c.name, c.emoji FROM player_cosmetics pc JOIN cosmetics c ON c.id=pc.cosmetic_id WHERE pc.player_id=? AND pc.cosmetic_id=?",
+        (uid, id)
+    ).fetchone()
+    if not owned:
+        conn.close()
+        await interaction.response.send_message("❌ Tu ne possèdes pas cet article.", ephemeral=True)
+        return
+
+    new_equipped = 0 if owned["equipped"] else 1
+
+    # Pour prefix : déséquiper l'ancien si on en équipe un nouveau
+    if owned["type"] == "prefix" and new_equipped == 1:
+        conn.execute("""
+            UPDATE player_cosmetics SET equipped=0
+            WHERE player_id=? AND cosmetic_id IN (
+                SELECT id FROM cosmetics WHERE type='prefix'
+            )
+        """, (uid,))
+
+    conn.execute("UPDATE player_cosmetics SET equipped=? WHERE player_id=? AND cosmetic_id=?", (new_equipped, uid, id))
+    conn.commit()
+    conn.close()
+
+    icon = owned["emoji"] or ""
+    status = "✅ Équipé" if new_equipped else "🔕 Déséquipé"
+    await interaction.response.send_message(
+        f"{status} : {icon} **{owned['name']}**",
+        ephemeral=True
+    )
+
+
+@tree.command(name="mescosmétiques", description="Voir tes cosmétiques achetés")
+async def mycosmetics_cmd(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT c.id, c.name, c.type, c.emoji, pc.equipped
+        FROM cosmetics c JOIN player_cosmetics pc ON pc.cosmetic_id=c.id
+        WHERE pc.player_id=?
+        ORDER BY c.type, c.name
+    """, (uid,)).fetchall()
+    player = conn.execute("SELECT points FROM players WHERE discord_id=?", (uid,)).fetchone()
+    conn.close()
+
+    embed = discord.Embed(
+        title="🎒 Mes cosmétiques",
+        description=f"**{player['points'] or 0} pts** disponibles",
+        color=0x6553e8
+    )
+    if not rows:
+        embed.add_field(name="Aucun cosmétique", value="Visite `/boutique` pour acheter !", inline=False)
+    else:
+        type_labels = {"role": "🎨 Rôles", "badge": "🏅 Badges", "prefix": "✨ Préfixes"}
+        by_type: dict = {}
+        for r in rows:
+            by_type.setdefault(r["type"], []).append(r)
+        for t, items in by_type.items():
+            lines = [f"{'✅' if i['equipped'] else '⬜'} `#{i['id']}` {i['emoji'] or ''} **{i['name']}**" for i in items]
+            embed.add_field(name=type_labels.get(t, t), value="\n".join(lines), inline=False)
+    embed.set_footer(text="✅ = équipé • /equiper <id> pour changer")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="addcosmétique", description="[ADMIN] Ajouter un article à la boutique")
+@app_commands.describe(
+    name="Nom de l'article",
+    type="Type : role / badge / prefix",
+    price="Prix en points",
+    description="Description",
+    emoji="Emoji (pour badge/prefix) ou hex color (pour role, ex: ff0000)",
+    rotating="Article rotatif ?",
+    days="Si rotatif : disponible combien de jours ?"
+)
+@app_commands.choices(type=[
+    app_commands.Choice(name="Rôle coloré", value="role"),
+    app_commands.Choice(name="Badge profil", value="badge"),
+    app_commands.Choice(name="Préfixe pseudo", value="prefix"),
+])
+async def addcosmetic_cmd(
+    interaction: discord.Interaction,
+    name: str, type: str, price: int,
+    description: str = "", emoji: str = "",
+    rotating: bool = False, days: int = 7
+):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+
+    role_color = None
+    available_until = None
+
+    if type == "role" and emoji:
+        try:
+            role_color = int(emoji.lstrip("#"), 16)
+            emoji = ""
+        except ValueError:
+            await interaction.response.send_message("❌ Couleur invalide, utilise un hex sans # (ex: ff0000).", ephemeral=True)
+            return
+
+    if rotating:
+        from datetime import datetime as dt, timedelta as td
+        available_until = (dt.utcnow() + td(days=days)).isoformat()
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO cosmetics (name, type, description, price, role_color, emoji, is_rotating, available_until) VALUES (?,?,?,?,?,?,?,?)",
+        (name, type, description, price, role_color, emoji or None, 1 if rotating else 0, available_until)
+    )
+    conn.commit()
+    item_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
+    conn.close()
+
+    await interaction.response.send_message(
+        f"✅ Article **{name}** ajouté à la boutique (ID: `{item_id}`, prix: **{price} pts**).",
+        ephemeral=True
+    )
+
+
+@tree.command(name="donnerpoints", description="[ADMIN] Donner des points à un joueur")
+@app_commands.describe(user="Joueur", points="Nombre de points")
+async def givepoints_cmd(interaction: discord.Interaction, user: discord.Member, points: int):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    conn = get_db()
+    conn.execute("UPDATE players SET points=COALESCE(points,0)+? WHERE discord_id=?", (points, str(user.id)))
+    conn.commit()
+    row = conn.execute("SELECT points FROM players WHERE discord_id=?", (str(user.id),)).fetchone()
+    conn.close()
+    await interaction.response.send_message(
+        f"✅ **+{points} pts** donnés à **{user.display_name}** (total: **{row['points']} pts**).",
+        ephemeral=True
+    )
+
+
+
+async def notify_followers(guild: discord.Guild, joiner_uid: str, joiner_name: str, queue_id: str):
+    """Envoie un DM aux joueurs qui suivent le joueur qui vient de rejoindre."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT follower_id FROM follows WHERE followed_id=?", (joiner_uid,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    q_info = QUEUES[queue_id]
+    for row in rows:
+        follower_id = row["follower_id"]
+        # Pas de notif si le follower est déjà en queue
+        if any(p["id"] == follower_id for p in queues[queue_id]):
+            continue
+        try:
+            member = guild.get_member(int(follower_id))
+            if not member:
+                continue
+            embed = discord.Embed(
+                title=f"👥 {joiner_name} est en queue !",
+                description=f"**{joiner_name}** vient de rejoindre la queue **{q_info['emoji']} {q_info['name']}**.",
+                color=q_info["color"]
+            )
+            embed.set_footer(text="Rejoins-le depuis le salon queue !")
+            await member.send(embed=embed)
+        except Exception:
+            pass
+
+
+@tree.command(name="suivre", description="Suivre un joueur pour être notifié quand il rejoint une queue")
+@app_commands.describe(user="Joueur à suivre")
+async def follow_cmd(interaction: discord.Interaction, user: discord.Member):
+    uid = str(interaction.user.id)
+    target_uid = str(user.id)
+    if uid == target_uid:
+        await interaction.response.send_message("❌ Tu ne peux pas te suivre toi-même.", ephemeral=True)
+        return
+    conn = get_db()
+    existing = conn.execute("SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?", (uid, target_uid)).fetchone()
+    if existing:
+        conn.close()
+        await interaction.response.send_message(f"⚠️ Tu suis déjà **{user.display_name}**.", ephemeral=True)
+        return
+    count = conn.execute("SELECT COUNT(*) as c FROM follows WHERE follower_id=?", (uid,)).fetchone()["c"]
+    if count >= 20:
+        conn.close()
+        await interaction.response.send_message("❌ Tu suis déjà 20 joueurs (maximum).", ephemeral=True)
+        return
+    conn.execute("INSERT INTO follows (follower_id, followed_id) VALUES (?,?)", (uid, target_uid))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(
+        f"✅ Tu suis maintenant **{user.display_name}** ! Tu seras notifié par DM quand il/elle rejoint une queue.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="nonsuivre", description="Ne plus suivre un joueur")
+@app_commands.describe(user="Joueur à ne plus suivre")
+async def unfollow_cmd(interaction: discord.Interaction, user: discord.Member):
+    uid = str(interaction.user.id)
+    target_uid = str(user.id)
+    conn = get_db()
+    conn.execute("DELETE FROM follows WHERE follower_id=? AND followed_id=?", (uid, target_uid))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(f"✅ Tu ne suis plus **{user.display_name}**.", ephemeral=True)
+
+
+@tree.command(name="mesamis", description="Voir la liste des joueurs que tu suis")
+async def myfollows_cmd(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    conn = get_db()
+    rows = conn.execute("SELECT followed_id FROM follows WHERE follower_id=?", (uid,)).fetchall()
+    conn.close()
+    if not rows:
+        await interaction.response.send_message("Tu ne suis personne pour l'instant. Utilise `/suivre @joueur`.", ephemeral=True)
+        return
+    names = []
+    for row in rows:
+        member = interaction.guild.get_member(int(row["followed_id"]))
+        names.append(f"• **{member.display_name}**" if member else f"• *Joueur inconnu ({row['followed_id']})*")
+    embed = discord.Embed(
+        title=f"👥 Joueurs suivis ({len(rows)}/20)",
+        description="\n".join(names),
+        color=0x6553e8
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @tree.command(name="addscout", description="[ADMIN] Attribuer le rôle Scout à un membre")
 @app_commands.describe(user="Membre à promouvoir Scout")
 async def addscout_cmd(interaction: discord.Interaction, user: discord.Member):
@@ -3654,16 +4194,104 @@ async def reports_cmd(interaction: discord.Interaction):
 
 
 # ─────────────────────────────────────────────
+#  TASK : synchro rangs Riot quotidienne
+# ─────────────────────────────────────────────
+@tasks.loop(hours=24)
+async def daily_rank_sync():
+    """Sync les rangs Riot de tous les joueurs une fois par jour."""
+    conn = get_db()
+    rows = conn.execute("SELECT discord_id, riot_id FROM players WHERE riot_id IS NOT NULL").fetchall()
+    conn.close()
+    print(f"[RANK SYNC] Démarrage synchro {len(rows)} joueurs...")
+    success = 0
+    for row in rows:
+        await sync_player_rank(row["discord_id"], row["riot_id"])
+        success += 1
+        await asyncio.sleep(2)  # 2s entre chaque req → ~30 req/min
+    print(f"[RANK SYNC] Terminé — {success}/{len(rows)} joueurs syncés")
+
+
+# ─────────────────────────────────────────────
 #  TASK : timeout queue
 # ─────────────────────────────────────────────
-@tasks.loop(minutes=5)
+class StillHereView(discord.ui.View):
+    """Bouton envoyé par DM pour confirmer qu'on est encore en queue."""
+    def __init__(self, uid: str, queue_id: str):
+        super().__init__(timeout=300)  # 5 min pour répondre
+        self.uid = uid
+        self.queue_id = queue_id
+
+    @discord.ui.button(label="✅ Je suis toujours là !", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = str(interaction.user.id)
+        # Reset le joined_at pour repartir à 0
+        for p in queues.get(self.queue_id, []):
+            if p["id"] == uid:
+                p["joined_at"] = datetime.now(timezone.utc)
+                break
+        # Retirer du warned
+        queue_timeout_warned.pop(uid, None)
+        button.disabled = True
+        button.label = "✅ Confirmé !"
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send("✅ Timer réinitialisé, tu restes en queue !", ephemeral=True)
+
+
+@tasks.loop(minutes=1)
 async def queue_timeout_check():
     now = datetime.now(timezone.utc)
+    warning_threshold = (QUEUE_TIMEOUT - 5) * 60  # 25 min → envoyer warning
+    kick_threshold = QUEUE_TIMEOUT * 60             # 30 min → kick
+
+    guild = None
+    for g in bot.guilds:
+        guild = g
+        break
+
     for qid in QUEUES:
-        to_remove = [p for p in queues[qid] if (now - p.get("joined_at", now)).total_seconds() > QUEUE_TIMEOUT * 60]
+        to_remove = []
+        for p in list(queues[qid]):
+            elapsed = (now - p.get("joined_at", now)).total_seconds()
+            uid = p["id"]
+
+            if elapsed >= kick_threshold:
+                # Kick
+                to_remove.append(p)
+                queue_timeout_warned.pop(uid, None)
+                try:
+                    member = guild.get_member(int(uid)) if guild else None
+                    if member:
+                        await member.send(embed=discord.Embed(
+                            title="⏰ Retiré de la queue",
+                            description=f"Tu as été retiré de la queue **{QUEUES[qid]['name']}** après {QUEUE_TIMEOUT} minutes d'inactivité.",
+                            color=0xff4444
+                        ))
+                except Exception:
+                    pass
+                print(f"⏰ Timeout kick {qid} : {p['name']}")
+
+            elif elapsed >= warning_threshold and uid not in queue_timeout_warned:
+                # Envoyer warning DM
+                queue_timeout_warned[uid] = now
+                try:
+                    member = guild.get_member(int(uid)) if guild else None
+                    if member:
+                        embed = discord.Embed(
+                            title="⚠️ Tu es encore là ?",
+                            description=f"Tu es en queue **{QUEUES[qid]['name']}** depuis 25 minutes.\n\nClique sur le bouton dans les **5 minutes** sinon tu seras retiré automatiquement.",
+                            color=0xffa500
+                        )
+                        await member.send(embed=embed, view=StillHereView(uid, qid))
+                except Exception:
+                    pass
+
         for p in to_remove:
-            queues[qid].remove(p)
-            print(f"⏰ Timeout queue {qid} : {p['name']}")
+            if p in queues[qid]:
+                queues[qid].remove(p)
+        if to_remove and guild:
+            await update_personal_queue_embeds(guild)
+            if len(queues[qid]) == 0:
+                queue_ping_state[qid]["mid"] = False
 
 
 @tree.command(name="lobbycode", description="Partager le code du lobby custom à tous les joueurs du match")
@@ -3830,6 +4458,7 @@ async def on_ready():
     for qid in QUEUES:
         bot.add_view(SharedQueueView(qid))
     queue_timeout_check.start()
+    daily_rank_sync.start()
     print("✅ Bot prêt !")
 
 
