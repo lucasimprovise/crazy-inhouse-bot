@@ -2405,29 +2405,67 @@ async def update_leaderboard(guild: discord.Guild):
 # ─────────────────────────────────────────────
 #  SLASH COMMANDS
 # ─────────────────────────────────────────────
+class RegisterModal(discord.ui.Modal, title="Inscription Crazy Inhouse"):
+    riot_id = discord.ui.TextInput(
+        label="Ton Riot ID",
+        placeholder="MonPseudo#TAG",
+        min_length=3,
+        max_length=50
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        riot_id_val = self.riot_id.value.strip()
+
+        if "#" not in riot_id_val:
+            await interaction.response.send_message(
+                "❌ Format invalide ! Exemple : `MonPseudo#EUW`", ephemeral=True
+            )
+            return
+
+        conn = get_db()
+        existing = conn.execute("SELECT discord_id FROM players WHERE discord_id=?", (uid,)).fetchone()
+        if existing:
+            conn.close()
+            await interaction.response.send_message("⚠️ Tu es déjà inscrit !", ephemeral=True)
+            return
+
+        conn.execute(
+            "INSERT INTO players (discord_id, username, riot_id) VALUES (?, ?, ?)",
+            (uid, interaction.user.display_name, riot_id_val)
+        )
+        conn.commit()
+        conn.close()
+
+        await interaction.response.defer(ephemeral=True)
+        await sync_rank_role(interaction.guild, interaction.user, 1000)
+        await create_player_space(interaction.guild, interaction.user)
+        await update_player_profil(interaction.guild, uid)
+
+        # Synchro rang Riot immédiate
+        rank_data = await sync_player_rank(uid, riot_id_val)
+
+        embed = discord.Embed(
+            title="✅ Inscription réussie !",
+            description=f"Bienvenue **{interaction.user.display_name}** ! Tu commences avec **1000 ELO** 🟫 Bronze.",
+            color=0x00ff88
+        )
+        if rank_data:
+            embed.add_field(name="🎯 Rang Riot récupéré", value=f"**{rank_data['tier']}** ({rank_data['rr']} RR)", inline=False)
+        embed.add_field(name="Prochaine étape", value="Rejoins la queue depuis le salon correspondant à ton niveau !", inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 @tree.command(name="register", description="S'inscrire au système in-house")
 async def register(interaction: discord.Interaction):
     uid = str(interaction.user.id)
     conn = get_db()
     existing = conn.execute("SELECT discord_id FROM players WHERE discord_id=?", (uid,)).fetchone()
+    conn.close()
     if existing:
-        conn.close()
         await interaction.response.send_message("⚠️ Tu es déjà inscrit !", ephemeral=True)
         return
-    conn.execute("INSERT INTO players (discord_id, username) VALUES (?, ?)", (uid, interaction.user.display_name))
-    conn.commit()
-    conn.close()
-    await sync_rank_role(interaction.guild, interaction.user, 1000)
-
-    # Créer l'espace privé si pas encore fait (au cas où on_member_join a raté)
-    await create_player_space(interaction.guild, interaction.user)
-
-    # Mettre à jour le profil dans l'espace privé
-    await update_player_profil(interaction.guild, uid)
-
-    embed = discord.Embed(title="✅ Inscription réussie !", description=f"Bienvenue **{interaction.user.display_name}** ! Tu commences avec **1000 ELO** 🟫 Bronze.", color=0x00ff88)
-    embed.add_field(name="Prochaine étape", value="Lie ton compte Riot avec `/setriot`, puis rejoins la queue depuis le salon correspondant à ton niveau !")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_modal(RegisterModal())
 
 
 @tree.command(name="setriot", description="Lier ton compte Riot/Valorant à ton profil")
