@@ -2522,8 +2522,11 @@ async def rank_cmd(interaction: discord.Interaction, user: discord.Member = None
     embed.add_field(name="💰 Points",       value=f"**{row['points'] or 0}** pts", inline=True)
     if row["riot_id"]:
         riot_val = f"`{row['riot_id']}`"
-        if row.get("val_rank"):
-            riot_val += f"\n🎯 **{row['val_rank']}**"
+        try:
+            if row["val_rank"]:
+                riot_val += f"\n🎯 **{row['val_rank']}**"
+        except (IndexError, KeyError):
+            pass
         embed.add_field(name="Compte Riot", value=riot_val, inline=False)
 
     if in_placement:
