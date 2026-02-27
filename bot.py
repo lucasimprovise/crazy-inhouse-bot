@@ -70,6 +70,15 @@ QUEUES = {
         "channel":     "queue-gamechangers",
         "chat":        "gc-chat",
     },
+    "immortal": {
+        "id":          "immortal",
+        "name":        "⚔️ Immo+",
+        "role":        "Queue Immortal",
+        "color":       0xff4444,
+        "emoji":       "⚔️",
+        "channel":     "queue-immortal",
+        "chat":        "immortal-chat",
+    },
     "test": {
         "id":          "test",
         "name":        "🧪 Test (Admin)",
@@ -85,7 +94,7 @@ QUEUES = {
 # État des pings par queue — anti-spam
 # first_at/mid_at = datetime du dernier ping, None si pas encore envoyé
 PING_COOLDOWN_MINUTES = 10  # délai minimum entre deux sessions de ping
-queue_ping_state: dict = {qid: {"first_at": None, "mid": False} for qid in ["radiant", "ascendant", "gamechangers", "test"]}
+queue_ping_state: dict = {qid: {"first_at": None, "mid": False} for qid in ["radiant", "ascendant", "gamechangers", "immortal", "test"]}
 
 # Joueurs qui ont reçu le DM de warning timeout mais n'ont pas encore répondu
 # {uid: datetime_du_warning}
@@ -113,12 +122,14 @@ def all_queued_players():
     """Retourne tous les joueurs en queue toutes queues confondues."""
     return [p for q in queues.values() for p in q]
 
+def get_player_queue_ids(uid: str) -> list[str]:
+    """Retourne la liste des queues dans lesquelles se trouve le joueur."""
+    return [qid for qid, q in queues.items() if any(p["id"] == uid for p in q)]
+
 def get_player_queue_id(uid: str) -> str | None:
-    """Retourne l'ID de queue dans laquelle se trouve le joueur."""
-    for qid, q in queues.items():
-        if any(p["id"] == uid for p in q):
-            return qid
-    return None
+    """Retourne la première queue dans laquelle se trouve le joueur (compat legacy)."""
+    ids = get_player_queue_ids(uid)
+    return ids[0] if ids else None
 
 # ─────────────────────────────────────────────
 #  DATABASE
@@ -1295,8 +1306,8 @@ class PersonalQueueView(discord.ui.View):
                 if uid in [p["id"] for p in m["team1"] + m["team2"]]:
                     await interaction.response.send_message("⚠️ Tu as déjà un match en cours !", ephemeral=True)
                     return
-            if get_player_queue_id(uid):
-                await interaction.response.send_message("⚠️ Tu es déjà en queue !", ephemeral=True)
+            if uid in [p["id"] for p in queues.get(queue_id, [])]:
+                await interaction.response.send_message("⚠️ Tu es déjà dans cette queue !", ephemeral=True)
                 return
 
             # Trouver les queues accessibles au joueur
@@ -1435,7 +1446,7 @@ class RoleSelectView(discord.ui.View):
                 await interaction.response.send_message("⚠️ Tu as déjà un match en cours !", ephemeral=True)
                 return
         if get_player_queue_id(uid):
-            await interaction.response.send_message("⚠️ Tu es déjà en queue !", ephemeral=True)
+            await interaction.response.send_message("⚠️ Tu es déjà dans cette queue !", ephemeral=True)
             return
 
         # Legacy RoleSelectView - redirige vers le salon personnel
@@ -1492,8 +1503,8 @@ class SharedQueueView(discord.ui.View):
                 if uid in [p["id"] for p in m["team1"] + m["team2"]]:
                     await interaction.response.send_message("⚠️ Tu as déjà un match en cours !", ephemeral=True)
                     return
-            if get_player_queue_id(uid):
-                await interaction.response.send_message("⚠️ Tu es déjà en queue !", ephemeral=True)
+            if uid in [p["id"] for p in queues.get(queue_id, [])]:
+                await interaction.response.send_message("⚠️ Tu es déjà dans cette queue !", ephemeral=True)
                 return
             if not player_has_queue_access(interaction.user, queue_id):
                 await interaction.response.send_message(
@@ -1505,17 +1516,16 @@ class SharedQueueView(discord.ui.View):
 
     async def _leave_cb(self, interaction: discord.Interaction):
         uid = str(interaction.user.id)
-        qid = get_player_queue_id(uid)
-        if not qid:
-            await interaction.response.send_message("⚠️ Tu n'es pas en queue !", ephemeral=True)
+        qid = self.queue_id  # On retire uniquement de la queue du bouton cliqué
+        if uid not in [p["id"] for p in queues.get(qid, [])]:
+            await interaction.response.send_message("⚠️ Tu n'es pas dans cette queue !", ephemeral=True)
             return
         queues[qid] = [p for p in queues[qid] if p["id"] != uid]
-        minutes = register_queue_leave(uid)
-        msg = f"👋 Retiré de la queue. Cooldown **{minutes} min**." if minutes > 0 else "👋 Retiré de la queue."
-        await interaction.response.send_message(msg, ephemeral=True)
-        # Reset mid si queue vide (first_at garde le cooldown temporel)
         if len(queues[qid]) == 0:
             queue_ping_state[qid]["mid"] = False
+        minutes = register_queue_leave(uid)
+        msg = f"👋 Retiré de **{QUEUES[qid]['name']}**. Cooldown **{minutes} min**." if minutes > 0 else f"👋 Retiré de **{QUEUES[qid]['name']}**."
+        await interaction.response.send_message(msg, ephemeral=True)
         await update_personal_queue_embeds(interaction.guild)
 
 
@@ -1965,6 +1975,11 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
     current_size = test_queue_size if test_mode else QUEUE_SIZE
     players = queues[queue_id][:current_size]
     queues[queue_id] = queues[queue_id][current_size:]
+    # Retirer les joueurs du match de toutes les autres queues
+    match_uids = {p["id"] for p in players}
+    for other_qid, other_q in queues.items():
+        if other_qid != queue_id:
+            queues[other_qid] = [p for p in other_q if p["id"] not in match_uids]
 
     # En mode test avec moins de 10 joueurs, on split simplement en 2
     if len(players) < QUEUE_SIZE:
