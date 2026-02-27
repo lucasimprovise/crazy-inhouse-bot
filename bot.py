@@ -70,12 +70,22 @@ QUEUES = {
         "channel":     "queue-gamechangers",
         "chat":        "gc-chat",
     },
+    "test": {
+        "id":          "test",
+        "name":        "🧪 Test (Admin)",
+        "role":        "Queue Test",
+        "color":       0x888888,
+        "emoji":       "🧪",
+        "channel":     "queue-test",
+        "chat":        "test-chat",
+        "test_only":   True,   # flag : pas de ping, accès admin seulement
+    },
 }
 
 # État des pings par queue — anti-spam
 # first_at/mid_at = datetime du dernier ping, None si pas encore envoyé
 PING_COOLDOWN_MINUTES = 10  # délai minimum entre deux sessions de ping
-queue_ping_state: dict = {qid: {"first_at": None, "mid": False} for qid in ["radiant", "ascendant", "gamechangers"]}
+queue_ping_state: dict = {qid: {"first_at": None, "mid": False} for qid in ["radiant", "ascendant", "gamechangers", "test"]}
 
 # Joueurs qui ont reçu le DM de warning timeout mais n'ont pas encore répondu
 # {uid: datetime_du_warning}
@@ -359,6 +369,8 @@ def update_queue_elo(discord_id: str, queue_id: str, conn=None, **kwargs):
         conn.close()
 
 def player_has_queue_access(member: discord.Member, queue_id: str) -> bool:
+    if QUEUES.get(queue_id, {}).get("test_only"):
+        return member.guild_permissions.administrator
     """Vérifie si le joueur a le rôle Discord pour accéder à cette queue."""
     required_role = QUEUES[queue_id]["role"]
     return any(r.name == required_role for r in member.roles)
@@ -748,12 +760,15 @@ def balance_teams(players: list[dict]) -> tuple[list, list]:
     conn = get_db()
     elos = {}
     for p in players:
-        row = conn.execute("SELECT elo, val_elo FROM players WHERE discord_id = ?", (p["id"],)).fetchone()
+        row = conn.execute("SELECT elo, val_rank FROM players WHERE discord_id = ?", (p["id"],)).fetchone()
         internal_elo = row["elo"] if row else 1000
         # Si on a un rang Riot vérifié, on mixe ELO interne + score du rang (60/40)
-        if row and row["val_rank"] and row["val_rank"] in VAL_TIER_ELO:
-            val_score = VAL_TIER_ELO[row["val_rank"]]
-            # Normalise val_score (0-1000) vers l'échelle interne (≈500-1800)
+        try:
+            val_rank = row["val_rank"] if row else None
+        except (IndexError, KeyError):
+            val_rank = None
+        if val_rank and val_rank in VAL_TIER_ELO:
+            val_score = VAL_TIER_ELO[val_rank]
             val_score_scaled = 500 + val_score * 1.3
             elos[p["id"]] = round(internal_elo * 0.6 + val_score_scaled * 0.4)
         else:
@@ -4540,7 +4555,7 @@ async def daily_rank_sync():
     for row in rows:
         await sync_player_rank(row["discord_id"], row["riot_id"])
         success += 1
-        await asyncio.sleep(2)  # 2s entre chaque req → ~30 req/min
+        await asyncio.sleep(3)  # 3s entre chaque req → ~20 req/min, évite les 429
     print(f"[RANK SYNC] Terminé — {success}/{len(rows)} joueurs syncés")
 
 
