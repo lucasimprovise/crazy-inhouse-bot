@@ -284,6 +284,7 @@ def init_db():
         "ALTER TABLE matches ADD COLUMN mvp TEXT",
         "ALTER TABLE matches ADD COLUMN season INTEGER DEFAULT 1",
         "ALTER TABLE player_channels ADD COLUMN notif_enabled INTEGER DEFAULT 1",
+        "ALTER TABLE player_channels ADD COLUMN notif_queues TEXT DEFAULT NULL",  # JSON list des queues activées, NULL = toutes
     ]
     # Create extra tables if missing
     for tbl_sql in [
@@ -1052,6 +1053,20 @@ QUEUE_ROLES = {
     "ascendant":    "Queue Ascendant",
     "gamechangers": "Queue GC",
 }
+
+def get_notif_queues(row) -> set:
+    """Retourne les queues pour lesquelles les notifs sont activées. None = toutes."""
+    import json as _json
+    if not row or row["notif_enabled"] == 0:
+        return set()  # notifs globalement désactivées
+    raw = row["notif_queues"] if row["notif_queues"] else None
+    if raw is None:
+        return set(QUEUES.keys())  # toutes par défaut
+    try:
+        return set(_json.loads(raw))
+    except Exception:
+        return set(QUEUES.keys())
+
 
 async def ping_queue_watchers(guild: discord.Guild, joiner_uid: str, joiner_name: str, queue_id: str, nb: int, size: int):
     """Ping dans le salon chat de la queue — une fois au 1er joueur, une fois à mi-chemin.
@@ -4240,23 +4255,107 @@ async def test_veto_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=veto_embed, view=view)
 
 
-@tree.command(name="notifications", description="Activer ou désactiver les alertes quand une queue se lance")
+class NotifQueuesView(discord.ui.View):
+    """Vue avec checkboxes pour choisir les queues dont on veut les notifs."""
+    def __init__(self, uid: str, active_queues: set):
+        super().__init__(timeout=60)
+        self.uid = uid
+        for qid, q in QUEUES.items():
+            if q.get("test_only"):
+                continue
+            btn = discord.ui.Button(
+                label=q["name"],
+                style=discord.ButtonStyle.success if qid in active_queues else discord.ButtonStyle.secondary,
+                custom_id=f"notif_q_{qid}"
+            )
+            btn.callback = self._make_toggle(qid)
+            self.add_item(btn)
+        # Bouton "Toutes / Aucune"
+        all_btn = discord.ui.Button(label="🔕 Tout désactiver", style=discord.ButtonStyle.danger, custom_id="notif_none", row=2)
+        all_btn.callback = self._disable_all
+        self.add_item(all_btn)
+        all_on = discord.ui.Button(label="🔔 Tout activer", style=discord.ButtonStyle.primary, custom_id="notif_all", row=2)
+        all_on.callback = self._enable_all
+        self.add_item(all_on)
+
+    def _make_toggle(self, qid: str):
+        async def callback(interaction: discord.Interaction):
+            if str(interaction.user.id) != self.uid:
+                await interaction.response.send_message("❌ Ce menu n'est pas pour toi.", ephemeral=True)
+                return
+            import json as _json
+            conn = get_db()
+            row = conn.execute("SELECT notif_enabled, notif_queues FROM player_channels WHERE discord_id=?", (self.uid,)).fetchone()
+            active = get_notif_queues(row)
+            if qid in active:
+                active.discard(qid)
+            else:
+                active.add(qid)
+            new_enabled = 1 if active else 0
+            conn.execute("UPDATE player_channels SET notif_enabled=?, notif_queues=? WHERE discord_id=?",
+                (new_enabled, _json.dumps(list(active)), self.uid))
+            conn.commit()
+            conn.close()
+            # Mettre à jour le style du bouton
+            for child in self.children:
+                if child.custom_id == f"notif_q_{qid}":
+                    child.style = discord.ButtonStyle.success if qid in active else discord.ButtonStyle.secondary
+            await interaction.response.edit_message(
+                content=self._summary(active),
+                view=self
+            )
+        return callback
+
+    async def _disable_all(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message("❌ Ce menu n'est pas pour toi.", ephemeral=True)
+            return
+        import json as _json
+        conn = get_db()
+        conn.execute("UPDATE player_channels SET notif_enabled=0, notif_queues=? WHERE discord_id=?", (_json.dumps([]), self.uid))
+        conn.commit()
+        conn.close()
+        for child in self.children:
+            if child.custom_id and child.custom_id.startswith("notif_q_"):
+                child.style = discord.ButtonStyle.secondary
+        await interaction.response.edit_message(content="🔕 Toutes les alertes désactivées.", view=self)
+
+    async def _enable_all(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message("❌ Ce menu n'est pas pour toi.", ephemeral=True)
+            return
+        import json as _json
+        all_queues = [qid for qid, q in QUEUES.items() if not q.get("test_only")]
+        conn = get_db()
+        conn.execute("UPDATE player_channels SET notif_enabled=1, notif_queues=? WHERE discord_id=?", (_json.dumps(all_queues), self.uid))
+        conn.commit()
+        conn.close()
+        for child in self.children:
+            if child.custom_id and child.custom_id.startswith("notif_q_"):
+                child.style = discord.ButtonStyle.success
+        await interaction.response.edit_message(content="🔔 Toutes les alertes activées.", view=self)
+
+    def _summary(self, active: set) -> str:
+        if not active:
+            return "🔕 Aucune alerte activée."
+        names = [QUEUES[q]["name"] for q in active if q in QUEUES]
+        return f"🔔 Alertes activées pour : {', '.join(names)}"
+
+
+@tree.command(name="notifications", description="Choisir pour quelles queues recevoir des alertes")
 async def notifications_cmd(interaction: discord.Interaction):
     uid = str(interaction.user.id)
     conn = get_db()
-    row = conn.execute("SELECT notif_enabled, notifs_channel FROM player_channels WHERE discord_id=?", (uid,)).fetchone()
+    row = conn.execute("SELECT notif_enabled, notif_queues FROM player_channels WHERE discord_id=?", (uid,)).fetchone()
     conn.close()
     if not row:
         await interaction.response.send_message("❌ Tu n'as pas encore d'espace privé.", ephemeral=True)
         return
-    new_val = 0 if row["notif_enabled"] else 1
-    conn2 = get_db()
-    conn2.execute("UPDATE player_channels SET notif_enabled=? WHERE discord_id=?", (new_val, uid))
-    conn2.commit()
-    conn2.close()
-    status = "🔔 **activées**" if new_val else "🔕 **désactivées**"
+    active = get_notif_queues(row)
+    view = NotifQueuesView(uid, active)
     await interaction.response.send_message(
-        f"Alertes queue {status}. Tu peux aussi changer ça depuis ton salon 📊︱profil.",
+        view._summary(active) + "\n\nClique sur une queue pour activer/désactiver ses alertes :",
+        view=view,
         ephemeral=True
     )
 
