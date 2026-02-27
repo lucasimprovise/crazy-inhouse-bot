@@ -3454,11 +3454,12 @@ def build_history_embed(matches: list, page: int, total_pages: int, target_name:
 
         # Score
         score_str = ""
-        if row.get("score_winner") and row.get("score_loser"):
-            if w == 1:
-                score_str = f" **{row['score_winner']}-{row['score_loser']}**"
-            else:
-                score_str = f" **{row['score_winner']}-{row['score_loser']}**"
+        try:
+            sw, sl = row["score_winner"], row["score_loser"]
+        except (IndexError, KeyError):
+            sw, sl = None, None
+        if sw and sl:
+            score_str = f" **{sw}-{sl}**"
 
         # Formater les joueurs avec ELO change
         def fmt_team(players, team_num):
