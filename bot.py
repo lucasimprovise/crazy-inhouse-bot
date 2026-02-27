@@ -2569,6 +2569,7 @@ async def finalize_match(interaction: discord.Interaction, match_id: str, winner
     await result_channel.send(embed=report_embed, view=ReportView(match_id, all_players))
 
     await update_leaderboard(guild)
+    await update_stats_counter(guild)
     del active_matches[match_id]
 
     # Mettre à jour les embeds personnels immédiatement
@@ -2667,6 +2668,46 @@ def build_leaderboard_embed(queue_id: str, season: int) -> discord.Embed:
     embed.description = "\n".join(lines) if lines else "*Aucun joueur dans cette queue.*"
     embed.set_footer(text="🔰 = en placement • 🔥 = streak ≥3 • 🌟 = MVP • Mis à jour après chaque match")
     return embed
+
+
+async def update_stats_counter(guild: discord.Guild):
+    """Met à jour le salon vocal compteur de matchs."""
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) as c FROM matches WHERE status='finished'").fetchone()["c"]
+    players = conn.execute("SELECT COUNT(*) as c FROM players").fetchone()["c"]
+    conn.close()
+
+    # Chercher ou créer la catégorie et les salons stats
+    cat = discord.utils.get(guild.categories, name="📊 STATS SERVEUR")
+    if not cat:
+        everyone = guild.default_role
+        cat = await guild.create_category("📊 STATS SERVEUR", overwrites={
+            everyone: discord.PermissionOverwrite(view_channel=True, connect=False)
+        })
+
+    # Salon matchs joués
+    vc_matches = discord.utils.get(guild.voice_channels, name__startswith="🎮 Matchs joués")
+    new_name_m = f"🎮 Matchs joués : {total}"
+    if vc_matches:
+        if vc_matches.name != new_name_m:
+            await vc_matches.edit(name=new_name_m)
+    else:
+        await guild.create_voice_channel(new_name_m, category=cat, overwrites={
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
+        })
+
+    # Salon joueurs inscrits
+    vc_players = discord.utils.get(guild.voice_channels, name__startswith="👥 Joueurs inscrits")
+    new_name_p = f"👥 Joueurs inscrits : {players}"
+    if vc_players:
+        if vc_players.name != new_name_p:
+            await vc_players.edit(name=new_name_p)
+    else:
+        await guild.create_voice_channel(new_name_p, category=cat, overwrites={
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
+        })
 
 
 async def update_leaderboard(guild: discord.Guild):
@@ -3642,6 +3683,58 @@ def get_player_badges(uid: str) -> str:
     """, (uid,)).fetchall()
     conn.close()
     return " ".join(r["emoji"] for r in rows) if rows else ""
+
+
+def get_or_create_player_shop(uid: str) -> list:
+    """Retourne la boutique personnelle du joueur. La génère si absente ou expirée."""
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    rows = conn.execute(
+        "SELECT cosmetic_id FROM player_shop WHERE player_id=? AND expires_at > ?",
+        (uid, now)
+    ).fetchall()
+
+    if len(rows) == 5:
+        ids = [r["cosmetic_id"] for r in rows]
+        items = conn.execute(
+            f"SELECT * FROM cosmetics WHERE id IN ({','.join('?'*len(ids))})",
+            ids
+        ).fetchall()
+        conn.close()
+        return items
+
+    # Générer une nouvelle boutique personnelle
+    all_rotating = conn.execute(
+        "SELECT id FROM cosmetics WHERE is_rotating=1 AND active=1"
+    ).fetchall()
+
+    owned = {r["cosmetic_id"] for r in conn.execute(
+        "SELECT cosmetic_id FROM player_cosmetics WHERE player_id=?", (uid,)
+    ).fetchall()}
+
+    available = [r["id"] for r in all_rotating if r["id"] not in owned]
+    if len(available) < 5:
+        available = [r["id"] for r in all_rotating]
+
+    selected = random.sample(available, min(5, len(available)))
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    conn.execute("DELETE FROM player_shop WHERE player_id=?", (uid,))
+    for cid in selected:
+        conn.execute(
+            "INSERT INTO player_shop (player_id, cosmetic_id, expires_at) VALUES (?,?,?)",
+            (uid, cid, tomorrow)
+        )
+    conn.commit()
+
+    items = conn.execute(
+        f"SELECT * FROM cosmetics WHERE id IN ({','.join('?'*len(selected))})",
+        selected
+    ).fetchall()
+    conn.close()
+    return items
 
 
 def build_shop_embed(rotating: bool = False, uid: str = None) -> discord.Embed:
@@ -5255,6 +5348,12 @@ async def on_ready():
     daily_shop_rotation.start()
     # Nettoyage boutiques expirées au démarrage
     rotate_shop()
+    # Mettre à jour les compteurs au démarrage
+    for g in bot.guilds:
+        try:
+            await update_stats_counter(g)
+        except Exception as e:
+            print(f"[STATS] Erreur init compteur: {e}")
     # Reset les embeds de queue au démarrage — évite les joueurs fantômes après restart
     for guild in bot.guilds:
         await update_personal_queue_embeds(guild)
