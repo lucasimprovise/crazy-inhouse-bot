@@ -3428,27 +3428,166 @@ async def leaderboard_cmd(interaction: discord.Interaction, queue: str = "radian
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tree.command(name="history", description="Historique des derniers matchs")
-@app_commands.describe(count="Nombre de matchs (max 10)")
-async def history_cmd(interaction: discord.Interaction, count: int = 5):
-    count = min(count, 10)
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM matches WHERE status='finished' ORDER BY ended_at DESC LIMIT ?", (count,)).fetchall()
-    conn.close()
-    if not rows:
-        await interaction.response.send_message("Aucun match terminé.", ephemeral=True)
-        return
-    embed = discord.Embed(title=f"📜 Derniers {count} matchs", color=0x5865f2)
-    for row in rows:
+def build_history_embed(matches: list, page: int, total_pages: int, target_name: str = None, guild=None) -> discord.Embed:
+    """Construit un embed détaillé pour une page de l'historique."""
+    import json as _json
+    title = f"📜 Historique des matchs"
+    if target_name:
+        title += f" — {target_name}"
+    embed = discord.Embed(title=title, color=0x5865f2)
+
+    if not matches:
+        embed.description = "Aucun match trouvé."
+        return embed
+
+    for row in matches:
+        try:
+            team1 = _json.loads(row["team1"]) if row["team1"] else []
+            team2 = _json.loads(row["team2"]) if row["team2"] else []
+            elo_changes = _json.loads(row["elo_changes"]) if row["elo_changes"] else {}
+        except Exception:
+            team1, team2, elo_changes = [], [], {}
+
         w = row["winner"]
-        ended = (row["ended_at"] or "?")[:10]
-        mvp_str = f" • MVP: <@{row['mvp']}>" if row["mvp"] else ""
-        embed.add_field(
-            name=f"Match {row['match_id'][-6:]} — {ended} • {row['map'] or '?'}",
-            value=f"🔴 T1 {'**✓**' if w==1 else '✗'} | 🔵 T2 {'**✓**' if w==2 else '✗'}{mvp_str}",
-            inline=False
+        ended = (row["ended_at"] or "?")[:16].replace("T", " ")
+        map_name = row["map"] or "?"
+
+        # Score
+        score_str = ""
+        if row.get("score_winner") and row.get("score_loser"):
+            if w == 1:
+                score_str = f" **{row['score_winner']}-{row['score_loser']}**"
+            else:
+                score_str = f" **{row['score_winner']}-{row['score_loser']}**"
+
+        # Formater les joueurs avec ELO change
+        def fmt_team(players, team_num):
+            lines = []
+            for p in players:
+                pid = p["id"] if isinstance(p, dict) else p
+                pname = p.get("username", pid) if isinstance(p, dict) else pid
+                # Résoudre le vrai nom Discord si possible
+                if guild:
+                    member = guild.get_member(int(pid))
+                    if member:
+                        pname = member.display_name
+                elo_delta = elo_changes.get(pid, {})
+                if isinstance(elo_delta, dict):
+                    delta = elo_delta.get("change", 0)
+                else:
+                    delta = elo_delta
+                delta_str = f"+{delta}" if delta > 0 else str(delta)
+                color = "🟢" if delta > 0 else "🔴"
+                won = (w == team_num)
+                lines.append(f"{'**' if won else ''}{pname}{'**' if won else ''} {color}`{delta_str}`")
+            return "\n".join(lines) if lines else "—"
+
+        t1_won = w == 1
+        t2_won = w == 2
+        t1_label = f"🔴 Team 1 {'✅' if t1_won else '❌'}{score_str if t1_won else ''}"
+        t2_label = f"🔵 Team 2 {'✅' if t2_won else '❌'}{score_str if t2_won else ''}"
+
+        mvp_str = ""
+        if row["mvp"]:
+            if guild:
+                mvp_member = guild.get_member(int(row["mvp"]))
+                mvp_name = mvp_member.display_name if mvp_member else row["mvp"]
+            else:
+                mvp_name = row["mvp"]
+            mvp_str = f"\n⭐ **MVP** : {mvp_name}"
+
+        header = f"**Match #{row['match_id'][-6:]}** • {map_name} • {ended}{mvp_str}"
+        value = (
+            f"{t1_label}\n{fmt_team(team1, 1)}\n\n{t2_label}\n{fmt_team(team2, 2)}"
         )
-    await interaction.response.send_message(embed=embed)
+        embed.add_field(name=header, value=value, inline=False)
+        embed.add_field(name="​", value="​", inline=False)  # spacer
+
+    embed.set_footer(text=f"Page {page}/{total_pages}")
+    return embed
+
+
+class HistoryView(discord.ui.View):
+    def __init__(self, uid_filter: str, target_name: str, guild, per_page: int = 3):
+        super().__init__(timeout=120)
+        self.uid_filter = uid_filter
+        self.target_name = target_name
+        self.guild = guild
+        self.per_page = per_page
+        self.page = 1
+        self.total_pages = 1
+
+    def get_matches(self) -> list:
+        import json as _json
+        conn = get_db()
+        if self.uid_filter:
+            all_matches = conn.execute(
+                "SELECT * FROM matches WHERE status='finished' ORDER BY ended_at DESC"
+            ).fetchall()
+            conn.close()
+            result = []
+            for m in all_matches:
+                try:
+                    t1 = _json.loads(m["team1"]) if m["team1"] else []
+                    t2 = _json.loads(m["team2"]) if m["team2"] else []
+                    ids = [p["id"] if isinstance(p, dict) else p for p in t1 + t2]
+                    if self.uid_filter in ids:
+                        result.append(m)
+                except Exception:
+                    pass
+            return result
+        else:
+            rows = conn.execute(
+                "SELECT * FROM matches WHERE status='finished' ORDER BY ended_at DESC"
+            ).fetchall()
+            conn.close()
+            return list(rows)
+
+    async def send(self, interaction: discord.Interaction):
+        all_matches = self.get_matches()
+        import math
+        self.total_pages = max(1, math.ceil(len(all_matches) / self.per_page))
+        page_matches = all_matches[(self.page - 1) * self.per_page : self.page * self.per_page]
+        embed = build_history_embed(page_matches, self.page, self.total_pages, self.target_name, self.guild)
+        self._update_buttons()
+        await interaction.response.send_message(embed=embed, view=self, ephemeral=True)
+
+    async def update(self, interaction: discord.Interaction):
+        all_matches = self.get_matches()
+        import math
+        self.total_pages = max(1, math.ceil(len(all_matches) / self.per_page))
+        self.page = max(1, min(self.page, self.total_pages))
+        page_matches = all_matches[(self.page - 1) * self.per_page : self.page * self.per_page]
+        embed = build_history_embed(page_matches, self.page, self.total_pages, self.target_name, self.guild)
+        self._update_buttons()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    def _update_buttons(self):
+        for child in self.children:
+            if child.custom_id == "hist_prev":
+                child.disabled = self.page <= 1
+            elif child.custom_id == "hist_next":
+                child.disabled = self.page >= self.total_pages
+
+    @discord.ui.button(label="◀ Précédent", style=discord.ButtonStyle.secondary, custom_id="hist_prev")
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        await self.update(interaction)
+
+    @discord.ui.button(label="Suivant ▶", style=discord.ButtonStyle.secondary, custom_id="hist_next")
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        await self.update(interaction)
+
+
+@tree.command(name="history", description="Historique détaillé des matchs")
+@app_commands.describe(user="Filtrer par joueur (optionnel)")
+async def history_cmd(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or None
+    uid_filter = str(target.id) if target else None
+    target_name = target.display_name if target else None
+    view = HistoryView(uid_filter=uid_filter, target_name=target_name, guild=interaction.guild)
+    await view.send(interaction)
 
 
 @tree.command(name="queue", description="[ADMIN] Afficher le panneau queue")
