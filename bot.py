@@ -336,6 +336,104 @@ def init_db():
 
     conn.close()
 
+    # Seed cosmétiques par défaut (INSERT OR IGNORE pour ne pas dupliquer)
+    default_cosmetics = [
+        # ── BADGES ──────────────────────────────────────────────────────
+        # Badges de rang / prestige
+        ("🏆 Champion", "badge", "Badge des champions de saison", 500, None, "🏆", 0),
+        ("💀 Sweat", "badge", "Pour les acharnés du grind", 300, None, "💀", 0),
+        ("🔥 En feu", "badge", "Streak de victoires légendaire", 250, None, "🔥", 0),
+        ("⚡ Electrique", "badge", "Réflexes fulgurants", 200, None, "⚡", 0),
+        ("🧊 Ice Cold", "badge", "Jamais de pression", 200, None, "🧊", 0),
+        ("🎯 Précis", "badge", "Headshot machine", 150, None, "🎯", 0),
+        ("👑 Royauté", "badge", "Le roi du serveur", 400, None, "👑", 0),
+        ("💎 Diamant", "badge", "Statut premium", 350, None, "💎", 0),
+        ("🌟 Star", "badge", "Toujours dans la lumière", 180, None, "🌟", 0),
+        ("🐉 Dragon", "badge", "Fearless", 300, None, "🐉", 0),
+        ("🦁 Lion", "badge", "Leader naturel", 250, None, "🦁", 0),
+        ("🐺 Loup", "badge", "Solo carry", 200, None, "🐺", 0),
+        ("🦊 Renard", "badge", "Rusé et imprévisible", 180, None, "🦊", 0),
+        ("🤖 Cyborg", "badge", "Précision mécanique", 220, None, "🤖", 0),
+        ("👾 Alien", "badge", "Hors catégorie", 260, None, "👾", 0),
+        ("🎭 Masque", "badge", "Toujours mystérieux", 150, None, "🎭", 0),
+        ("🏅 Vétéran", "badge", "Ancienneté respectée", 400, None, "🏅", 0),
+        ("🎮 Gamer", "badge", "Né pour ça", 100, None, "🎮", 0),
+        ("🚀 Fusée", "badge", "Monte en flèche", 180, None, "🚀", 0),
+        ("☠️ No Mercy", "badge", "Pas de pitié", 280, None, "☠️", 0),
+        ("🌈 Coloré", "badge", "Apporte la bonne humeur", 120, None, "🌈", 0),
+        ("🎪 Showman", "badge", "Le show doit continuer", 160, None, "🎪", 0),
+        ("💪 Muscle", "badge", "Physiquement et mentalement", 140, None, "💪", 0),
+        ("🧠 Big Brain", "badge", "IQ hors norme", 220, None, "🧠", 0),
+        ("👁️ All-Seeing", "badge", "Rien ne t'échappe", 240, None, "👁️", 0),
+        # ── PRÉFIXES ────────────────────────────────────────────────────
+        ("🏆 Préfixe Champion", "prefix", "Affiche 🏆 devant ton pseudo", 600, None, "🏆", 0),
+        ("👑 Préfixe King", "prefix", "Affiche 👑 devant ton pseudo", 450, None, "👑", 0),
+        ("🔥 Préfixe Feu", "prefix", "Affiche 🔥 devant ton pseudo", 250, None, "🔥", 0),
+        ("💀 Préfixe Skull", "prefix", "Affiche 💀 devant ton pseudo", 300, None, "💀", 0),
+        ("⚡ Préfixe Éclair", "prefix", "Affiche ⚡ devant ton pseudo", 200, None, "⚡", 0),
+        ("🎯 Préfixe Cible", "prefix", "Affiche 🎯 devant ton pseudo", 180, None, "🎯", 0),
+        ("🐉 Préfixe Dragon", "prefix", "Affiche 🐉 devant ton pseudo", 350, None, "🐉", 0),
+        ("🚀 Préfixe Rocket", "prefix", "Affiche 🚀 devant ton pseudo", 200, None, "🚀", 0),
+        ("🧊 Préfixe Ice", "prefix", "Affiche 🧊 devant ton pseudo", 220, None, "🧊", 0),
+        ("🌟 Préfixe Star", "prefix", "Affiche 🌟 devant ton pseudo", 180, None, "🌟", 0),
+        ("💎 Préfixe Diamond", "prefix", "Affiche 💎 devant ton pseudo", 400, None, "💎", 0),
+        ("☠️ Préfixe Reaper", "prefix", "Affiche ☠️ devant ton pseudo", 280, None, "☠️", 0),
+        ("🦁 Préfixe Lion", "prefix", "Affiche 🦁 devant ton pseudo", 260, None, "🦁", 0),
+        ("👾 Préfixe Alien", "prefix", "Affiche 👾 devant ton pseudo", 240, None, "👾", 0),
+        ("🤖 Préfixe Bot", "prefix", "Affiche 🤖 devant ton pseudo", 220, None, "🤖", 0),
+        # ── RÔLES COLORÉS ───────────────────────────────────────────────
+        ("🔴 Rouge vif", "role", "Rôle coloré rouge vif", 300, 0xFF0000, None, 0),
+        ("🔵 Bleu électrique", "role", "Rôle coloré bleu électrique", 300, 0x0080FF, None, 0),
+        ("🟢 Vert néon", "role", "Rôle coloré vert néon", 300, 0x00FF80, None, 0),
+        ("🟡 Or brillant", "role", "Rôle coloré or brillant", 350, 0xFFD700, None, 0),
+        ("🟠 Orange feu", "role", "Rôle coloré orange feu", 300, 0xFF6600, None, 0),
+        ("🟣 Violet royal", "role", "Rôle coloré violet royal", 300, 0x8B00FF, None, 0),
+        ("⚪ Blanc pur", "role", "Rôle coloré blanc pur", 250, 0xFFFFFF, None, 0),
+        ("🩷 Rose vif", "role", "Rôle coloré rose vif", 300, 0xFF1493, None, 0),
+        ("🩵 Cyan glacé", "role", "Rôle coloré cyan glacé", 300, 0x00FFFF, None, 0),
+        ("🟤 Bronze", "role", "Rôle coloré bronze", 200, 0xCD7F32, None, 0),
+        ("🔶 Ambre", "role", "Rôle coloré ambre", 250, 0xFFBF00, None, 0),
+        ("🌺 Corail", "role", "Rôle coloré corail", 280, 0xFF6B6B, None, 0),
+        ("🫐 Myrtille", "role", "Rôle coloré bleu myrtille", 280, 0x4B0082, None, 0),
+        ("🍀 Émeraude", "role", "Rôle coloré vert émeraude", 320, 0x50C878, None, 0),
+        ("🌸 Sakura", "role", "Rôle coloré rose sakura", 300, 0xFFB7C5, None, 0),
+        # ── ROTATIFS EXCLUSIFS (is_rotating=1) ──────────────────────────
+        ("🌙 Minuit", "role", "Rôle exclusif bleu nuit profond", 500, 0x0D0D2B, None, 1),
+        ("🌊 Abyssal", "role", "Rôle exclusif bleu abyssal", 550, 0x003366, None, 1),
+        ("🌿 Forêt noire", "role", "Rôle exclusif vert forêt", 480, 0x1A3300, None, 1),
+        ("🩸 Sang", "role", "Rôle exclusif rouge sang", 520, 0x8B0000, None, 1),
+        ("⚗️ Toxique", "role", "Rôle exclusif vert toxique", 500, 0x39FF14, None, 1),
+        ("🌌 Galaxie", "role", "Rôle exclusif violet galaxie", 600, 0x2E0854, None, 1),
+        ("🔮 Cristal", "role", "Rôle exclusif violet cristal", 580, 0x9B59B6, None, 1),
+        ("🌅 Aurore", "role", "Rôle exclusif orange aurore", 520, 0xFF4500, None, 1),
+        ("❄️ Arctique", "role", "Rôle exclusif bleu arctique", 500, 0xADD8E6, None, 1),
+        ("🔱 Poseidon", "role", "Rôle exclusif bleu Poseidon", 600, 0x006994, None, 1),
+        ("💣 Bombe", "badge", "Badge exclusif pour les joueurs explosifs", 450, None, "💣", 1),
+        ("🎰 Lucky", "badge", "Badge exclusif chance", 400, None, "🎰", 1),
+        ("🦋 Papillon", "badge", "Badge exclusif délicat mais mortel", 380, None, "🦋", 1),
+        ("🌪️ Tornade", "badge", "Badge exclusif force de la nature", 420, None, "🌪️", 1),
+        ("🎸 Rockstar", "badge", "Badge exclusif pour les légendes", 460, None, "🎸", 1),
+        ("🧨 Pétard", "badge", "Badge exclusif pour les clutcheurs", 400, None, "🧨", 1),
+        ("🦅 Aigle", "badge", "Badge exclusif vision parfaite", 440, None, "🦅", 1),
+        ("🌊 Vague", "prefix", "Préfixe exclusif 🌊", 500, None, "🌊", 1),
+        ("💫 Nova", "prefix", "Préfixe exclusif 💫", 480, None, "💫", 1),
+        ("🎖️ Médaillé", "prefix", "Préfixe exclusif 🎖️", 550, None, "🎖️", 1),
+        ("🔱 Trident", "prefix", "Préfixe exclusif 🔱", 600, None, "🔱", 1),
+        ("🌙 Lunaire", "prefix", "Préfixe exclusif 🌙", 520, None, "🌙", 1),
+        ("⚜️ Fleur de Lys", "prefix", "Préfixe exclusif ⚜️", 580, None, "⚜️", 1),
+    ]
+
+    conn2 = get_db()
+    for name, ctype, desc, price, color, emoji, rotating in default_cosmetics:
+        existing = conn2.execute("SELECT id FROM cosmetics WHERE name=?", (name,)).fetchone()
+        if not existing:
+            conn2.execute(
+                "INSERT INTO cosmetics (name, type, description, price, role_color, emoji, is_rotating, active) VALUES (?,?,?,?,?,?,?,1)",
+                (name, ctype, desc, price, color, emoji, rotating)
+            )
+    conn2.commit()
+    conn2.close()
+
 def get_current_season() -> int:
     conn = get_db()
     row = conn.execute("SELECT MAX(season_id) as s FROM seasons").fetchone()
@@ -3122,6 +3220,15 @@ async def init_server_cmd(interaction: discord.Interaction):
         role_candidat: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True, use_application_commands=True),
     }
     ch_cmds = await get_or_create_text("📝︱commandes", cat_general, ow_cmds, "Utilise ici /register, /rank, /stats, /setriot")
+
+    # Salon récap hebdo — lecture seule pour les membres
+    ow_recap = {
+        everyone: discord.PermissionOverwrite(view_channel=False),
+        role_membre: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+        me: ow_full(),
+        role_admin: ow_full(),
+    }
+    await get_or_create_text("📋︱récap-hebdo", cat_general, ow_recap, "Récap hebdomadaire automatique tous les vendredis soir")
     async for msg in ch_cmds.history(limit=5):
         if msg.author == me and msg.embeds:
             break
@@ -3537,16 +3644,19 @@ def get_player_badges(uid: str) -> str:
     return " ".join(r["emoji"] for r in rows) if rows else ""
 
 
-def build_shop_embed(rotating: bool = False) -> discord.Embed:
+def build_shop_embed(rotating: bool = False, uid: str = None) -> discord.Embed:
     """Construit l'embed de la boutique."""
     conn = get_db()
     if rotating:
-        rows = conn.execute("""
-            SELECT * FROM cosmetics WHERE active=1 AND is_rotating=1
-            AND (available_until IS NULL OR available_until > datetime('now'))
-            ORDER BY price
-        """).fetchall()
-        title = "🔄 Boutique Rotative"
+        if uid:
+            rows = get_or_create_player_shop(uid)
+            title = "🔄 Ta Boutique du Jour"
+        else:
+            rows = conn.execute("""
+                SELECT * FROM cosmetics WHERE active=1 AND is_rotating=1
+                ORDER BY price
+            """).fetchall()
+            title = "🔄 Boutique Rotative"
         color = 0xff9900
     else:
         rows = conn.execute("""
@@ -3586,7 +3696,8 @@ def build_shop_embed(rotating: bool = False) -> discord.Embed:
     app_commands.Choice(name="Boutique rotative", value="rotating"),
 ])
 async def boutique_cmd(interaction: discord.Interaction, type: str = "fixed"):
-    embed = build_shop_embed(rotating=(type == "rotating"))
+    uid = str(interaction.user.id)
+    embed = build_shop_embed(rotating=(type == "rotating"), uid=uid)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -4670,6 +4781,51 @@ async def replace_player_cmd(interaction: discord.Interaction, joueur: discord.M
 
 
 # ─────────────────────────────────────────────
+#  TASK : rotation quotidienne boutique (5 articles/jour)
+# ─────────────────────────────────────────────
+@tasks.loop(hours=1)
+async def daily_shop_rotation():
+    """Sélectionne 5 nouveaux articles rotatifs chaque jour à minuit."""
+    now = datetime.now(timezone.utc)
+    if now.hour != 0:
+        return
+    rotate_shop()
+    print("[SHOP] Rotation quotidienne effectuée")
+
+
+def rotate_shop():
+    """Sélectionne aléatoirement 5 cosmétiques rotatifs actifs pour aujourd'hui."""
+    import json as _json
+    conn = get_db()
+    # Récupérer tous les cosmétiques rotatifs dispo
+    all_rotating = conn.execute(
+        "SELECT id FROM cosmetics WHERE is_rotating=1 AND active=1"
+    ).fetchall()
+    conn.close()
+
+    if len(all_rotating) < 5:
+        return
+
+    selected = random.sample([r["id"] for r in all_rotating], 5)
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+
+    conn = get_db()
+    # Désactiver tous les rotatifs actuellement en vitrine
+    conn.execute("UPDATE cosmetics SET available_until=NULL WHERE is_rotating=1")
+    # Activer les 5 sélectionnés pour aujourd'hui
+    for cid in selected:
+        conn.execute(
+            "UPDATE cosmetics SET available_until=? WHERE id=?",
+            (tomorrow, cid)
+        )
+    conn.commit()
+    conn.close()
+    print(f"[SHOP] 5 nouveaux articles rotatifs : {selected}")
+
+
+# ─────────────────────────────────────────────
 #  TASK : récap hebdomadaire (vendredi 20h)
 # ─────────────────────────────────────────────
 @tasks.loop(hours=1)
@@ -5096,6 +5252,9 @@ async def on_ready():
     queue_timeout_check.start()
     daily_rank_sync.start()
     weekly_recap_task.start()
+    daily_shop_rotation.start()
+    # Nettoyage boutiques expirées au démarrage
+    rotate_shop()
     # Reset les embeds de queue au démarrage — évite les joueurs fantômes après restart
     for guild in bot.guilds:
         await update_personal_queue_embeds(guild)
