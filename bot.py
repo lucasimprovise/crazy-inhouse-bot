@@ -4541,6 +4541,167 @@ async def replace_player_cmd(interaction: discord.Interaction, joueur: discord.M
         ephemeral=True
     )
 
+
+# ─────────────────────────────────────────────
+#  TASK : récap hebdomadaire (vendredi 20h)
+# ─────────────────────────────────────────────
+@tasks.loop(hours=1)
+async def weekly_recap_task():
+    """Poste le récap hebdomadaire chaque vendredi à 20h (heure Paris)."""
+    now = datetime.now(timezone.utc)
+    # Vendredi = weekday 4, 20h UTC (21h Paris hiver / 22h été)
+    if now.weekday() != 4 or now.hour != 19:
+        return
+
+    for guild in bot.guilds:
+        await post_weekly_recap(guild)
+
+
+async def post_weekly_recap(guild: discord.Guild):
+    """Construit et poste le récap hebdo dans #récap-hebdo."""
+    conn = get_db()
+
+    # Matchs de la semaine (7 derniers jours)
+    week_matches = conn.execute("""
+        SELECT * FROM matches
+        WHERE status='finished'
+        AND ended_at >= datetime('now', '-7 days')
+    """).fetchall()
+
+    nb_matchs = len(week_matches)
+
+    # MVP de la semaine — joueur avec le plus de MVP sur les 7 derniers jours
+    mvp_counts: dict = {}
+    for m in week_matches:
+        if m["mvp"]:
+            mvp_counts[m["mvp"]] = mvp_counts.get(m["mvp"], 0) + 1
+
+    # Meilleur streak de la semaine
+    top_streak = conn.execute("""
+        SELECT discord_id, username, best_streak
+        FROM players
+        ORDER BY best_streak DESC
+        LIMIT 1
+    """).fetchone()
+
+    # Top 3 ELO global
+    top_elo = conn.execute("""
+        SELECT discord_id, username, elo, wins, losses
+        FROM players
+        WHERE wins + losses > 0
+        ORDER BY elo DESC
+        LIMIT 3
+    """).fetchall()
+
+    # Top joueur de la semaine (plus de victoires sur 7j)
+    week_wins: dict = {}
+    for m in week_matches:
+        import json as _json
+        try:
+            elo_changes = _json.loads(m["elo_changes"]) if m["elo_changes"] else {}
+        except Exception:
+            elo_changes = {}
+        winner = m["winner"]
+        if winner:
+            try:
+                team = _json.loads(m["team1"]) if winner == 1 else _json.loads(m["team2"])
+                for p in team:
+                    pid = p["id"] if isinstance(p, dict) else p
+                    week_wins[pid] = week_wins.get(pid, 0) + 1
+            except Exception:
+                pass
+
+    conn.close()
+
+    # Construire l'embed
+    embed = discord.Embed(
+        title="📋 Récap de la semaine",
+        description=f"**{nb_matchs} match{'s' if nb_matchs > 1 else ''}** joué{'s' if nb_matchs > 1 else ''} cette semaine !",
+        color=0xffd700,
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    # Top 3 ELO
+    if top_elo:
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for i, row in enumerate(top_elo):
+            total = row["wins"] + row["losses"]
+            wr = round(row["wins"] / total * 100) if total > 0 else 0
+            member = guild.get_member(int(row["discord_id"]))
+            name = member.display_name if member else row["username"]
+            lines.append(f"{medals[i]} **{name}** — {row['elo']} ELO ({wr}% WR)")
+        embed.add_field(name="🏆 Top 3 ELO", value="\n".join(lines), inline=False)
+
+    # MVP de la semaine
+    if mvp_counts:
+        top_mvp_id = max(mvp_counts, key=mvp_counts.get)
+        top_mvp_nb = mvp_counts[top_mvp_id]
+        mvp_member = guild.get_member(int(top_mvp_id))
+        mvp_name = mvp_member.display_name if mvp_member else top_mvp_id
+        embed.add_field(
+            name="⭐ MVP de la semaine",
+            value=f"**{mvp_name}** — {top_mvp_nb} MVP{'s' if top_mvp_nb > 1 else ''}",
+            inline=True
+        )
+
+    # Meilleur streak
+    if top_streak and top_streak["best_streak"] > 0:
+        s_member = guild.get_member(int(top_streak["discord_id"]))
+        s_name = s_member.display_name if s_member else top_streak["username"]
+        embed.add_field(
+            name="🔥 Meilleur streak",
+            value=f"**{s_name}** — {top_streak['best_streak']} victoires consécutives",
+            inline=True
+        )
+
+    # Top victoires de la semaine
+    if week_wins:
+        top_uid = max(week_wins, key=week_wins.get)
+        top_w = week_wins[top_uid]
+        top_member = guild.get_member(int(top_uid))
+        top_name = top_member.display_name if top_member else top_uid
+        embed.add_field(
+            name="💪 Plus de victoires cette semaine",
+            value=f"**{top_name}** — {top_w} win{'s' if top_w > 1 else ''}",
+            inline=False
+        )
+
+    if nb_matchs == 0:
+        embed.description = "Aucun match joué cette semaine. On se bouge la semaine prochaine ! 💪"
+        embed.color = 0x888888
+
+    embed.set_footer(text="Crazy Inhouse • Récap hebdomadaire")
+
+    # Poster dans #récap-hebdo
+    recap_ch = discord.utils.get(guild.text_channels, name="récap-hebdo")
+    if not recap_ch:
+        # Chercher dans la catégorie GÉNÉRAL
+        cat = discord.utils.get(guild.categories, name="📢 GÉNÉRAL")
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        recap_ch = await guild.create_text_channel(
+            "récap-hebdo",
+            category=cat,
+            overwrites=overwrites,
+            topic="Récap hebdomadaire automatique tous les vendredis soir"
+        )
+
+    await recap_ch.send(embed=embed)
+
+
+@tree.command(name="recap", description="[ADMIN] Poster le récap hebdo manuellement")
+async def recap_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await post_weekly_recap(interaction.guild)
+    await interaction.followup.send("✅ Récap posté !", ephemeral=True)
+
+
 # ─────────────────────────────────────────────
 #  TASK : synchro rangs Riot quotidienne
 # ─────────────────────────────────────────────
@@ -4807,6 +4968,7 @@ async def on_ready():
         bot.add_view(SharedQueueView(qid))
     queue_timeout_check.start()
     daily_rank_sync.start()
+    weekly_recap_task.start()
     # Reset les embeds de queue au démarrage — évite les joueurs fantômes après restart
     for guild in bot.guilds:
         await update_personal_queue_embeds(guild)
