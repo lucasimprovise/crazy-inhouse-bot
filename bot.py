@@ -284,7 +284,9 @@ def init_db():
         "ALTER TABLE matches ADD COLUMN mvp TEXT",
         "ALTER TABLE matches ADD COLUMN season INTEGER DEFAULT 1",
         "ALTER TABLE player_channels ADD COLUMN notif_enabled INTEGER DEFAULT 1",
-        "ALTER TABLE player_channels ADD COLUMN notif_queues TEXT DEFAULT NULL",  # JSON list des queues activées, NULL = toutes
+        "ALTER TABLE player_channels ADD COLUMN notif_queues TEXT DEFAULT NULL",
+        "ALTER TABLE matches ADD COLUMN score_winner INTEGER DEFAULT NULL",
+        "ALTER TABLE matches ADD COLUMN score_loser INTEGER DEFAULT NULL",
     ]
     # Create extra tables if missing
     for tbl_sql in [
@@ -320,6 +322,12 @@ def init_db():
                 placement_done INTEGER DEFAULT 0,
                 season       INTEGER DEFAULT 1,
                 PRIMARY KEY (discord_id, queue_id)
+            )""",
+        """CREATE TABLE IF NOT EXISTS player_shop (
+                player_id    TEXT NOT NULL,
+                cosmetic_id  INTEGER NOT NULL,
+                expires_at   TEXT NOT NULL,
+                PRIMARY KEY (player_id, cosmetic_id)
             )"""
     ]:
         try:
