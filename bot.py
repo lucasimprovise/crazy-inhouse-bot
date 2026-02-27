@@ -4119,18 +4119,31 @@ async def test_mode_cmd(interaction: discord.Interaction, players: int = 2):
     await update_queue_message(interaction)
 
 
-@tree.command(name="fillqueue", description="[ADMIN] Remplir la queue avec des joueurs fictifs pour tester")
-async def fill_queue_cmd(interaction: discord.Interaction):
+@tree.command(name="fillqueue", description="[ADMIN] Remplir une queue avec des joueurs fictifs pour tester")
+@app_commands.describe(queue="Queue à remplir")
+@app_commands.choices(queue=[
+    app_commands.Choice(name=QUEUES[qid]["name"], value=qid) for qid in QUEUES if not QUEUES[qid].get("test_only")
+])
+async def fill_queue_cmd(interaction: discord.Interaction, queue: str = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
         return
 
     current_size = test_queue_size if test_mode else QUEUE_SIZE
-    # Fillqueue utilise la queue ascendant par défaut pour les tests
-    fill_qid = next((qid for qid, q in queues.items() if len(q) < current_size), list(QUEUES.keys())[0])
+
+    # Si aucune queue spécifiée, prendre la première qui a des joueurs (ou la première dispo)
+    if queue:
+        fill_qid = queue
+    else:
+        fill_qid = next((qid for qid, q in queues.items() if 0 < len(q) < current_size), list(QUEUES.keys())[0])
+
+    if fill_qid not in QUEUES:
+        await interaction.response.send_message("❌ Queue introuvable.", ephemeral=True)
+        return
+
     spots_left = current_size - len(queues[fill_qid])
     if spots_left <= 0:
-        await interaction.response.send_message("⚠️ La queue est déjà pleine !", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ La queue **{QUEUES[fill_qid]['name']}** est déjà pleine !", ephemeral=True)
         return
 
     fake_names = [
