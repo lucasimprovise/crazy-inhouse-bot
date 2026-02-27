@@ -4462,6 +4462,9 @@ async def on_ready():
         bot.add_view(SharedQueueView(qid))
     queue_timeout_check.start()
     daily_rank_sync.start()
+    # Reset les embeds de queue au démarrage — évite les joueurs fantômes après restart
+    for guild in bot.guilds:
+        await update_personal_queue_embeds(guild)
     print("✅ Bot prêt !")
 
 
