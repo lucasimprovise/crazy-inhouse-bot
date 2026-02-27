@@ -97,6 +97,7 @@ cooldowns: dict = {}
 queue_leave_counts: dict = {}   # uid -> {"count": int, "last_reset": datetime}
 test_mode: bool = False
 test_queue_size: int = QUEUE_SIZE
+match_votes: dict[str, dict] = {}  # match_id -> {"team1": set(uid), "team2": set(uid), "timeout_task": Task|None}
 
 def all_queued_players():
     """Retourne tous les joueurs en queue toutes queues confondues."""
@@ -1265,6 +1266,12 @@ class PersonalQueueView(discord.ui.View):
             if not row:
                 await interaction.response.send_message("❌ Tu n'es pas inscrit ! Utilise `/register`.", ephemeral=True)
                 return
+            if not row["riot_id"]:
+                await interaction.response.send_message(
+                    "❌ Tu dois lier ton compte Riot avant de rejoindre une queue !\nUtilise `/setriot MonPseudo#TAG`.",
+                    ephemeral=True
+                )
+                return
             if uid in cooldowns and datetime.now(timezone.utc) < cooldowns[uid]:
                 remaining = int((cooldowns[uid] - datetime.now(timezone.utc)).total_seconds() / 60) + 1
                 await interaction.response.send_message(f"⏳ Cooldown actif : encore **{remaining} min**.", ephemeral=True)
@@ -1456,6 +1463,12 @@ class SharedQueueView(discord.ui.View):
             if not row:
                 await interaction.response.send_message("❌ Tu n'es pas inscrit ! Utilise `/register`.", ephemeral=True)
                 return
+            if not row["riot_id"]:
+                await interaction.response.send_message(
+                    "❌ Tu dois lier ton compte Riot avant de rejoindre une queue !\nUtilise `/setriot MonPseudo#TAG`.",
+                    ephemeral=True
+                )
+                return
             if uid in cooldowns and datetime.now(timezone.utc) < cooldowns[uid]:
                 remaining = int((cooldowns[uid] - datetime.now(timezone.utc)).total_seconds() / 60) + 1
                 await interaction.response.send_message(f"⏳ Cooldown actif : encore **{remaining} min**.", ephemeral=True)
@@ -1594,6 +1607,9 @@ class ScoreModal(discord.ui.Modal, title="Entrer le score du match"):
         await finalize_match(interaction, self.match_id, self.winner, score_winner=sw, score_loser=sl)
 
 
+VOTE_THRESHOLD  = 6   # votes pour valider automatiquement
+VOTE_TIMEOUT    = 600 # secondes avant validation automatique (10 min)
+
 class MatchResultView(discord.ui.View):
     def __init__(self, match_id: str):
         super().__init__(timeout=None)
@@ -1605,14 +1621,19 @@ class MatchResultView(discord.ui.View):
         coach_role = discord.utils.get(interaction.guild.roles, name="Coach")
         return coach_role in interaction.user.roles if coach_role else False
 
+    def is_player_in_match(self, uid: str) -> bool:
+        match = active_matches.get(self.match_id)
+        if not match:
+            return False
+        return uid in [p["id"] for p in match["team1"] + match["team2"]]
+
     async def check_screenshot(self, interaction: discord.Interaction) -> bool:
-        """Vérifie qu'au moins une image a été postée dans le channel scoreboard."""
         match = active_matches.get(self.match_id)
         if not match:
             return False
         sb_channel_id = match.get("scoreboard_channel")
         if not sb_channel_id:
-            return True  # Pas de channel scoreboard = pas de vérification
+            return True
         sb_channel = interaction.guild.get_channel(sb_channel_id)
         if not sb_channel:
             return True
@@ -1623,39 +1644,129 @@ class MatchResultView(discord.ui.View):
                         return True
         return False
 
-    @discord.ui.button(label="🏆 Team 1 a gagné", style=discord.ButtonStyle.success, custom_id="win_team1")
-    async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.is_coach_or_admin(interaction):
-            await interaction.response.send_message("❌ Seul un **Admin** ou **Coach** peut valider le résultat.", ephemeral=True)
-            return
-        has_screenshot = await self.check_screenshot(interaction)
-        if not has_screenshot:
-            match = active_matches.get(self.match_id)
-            sb_id = match.get("scoreboard_channel") if match else None
-            sb_mention = f"<#{sb_id}>" if sb_id else "le channel scoreboard"
-            await interaction.response.send_message(
-                f"❌ **Aucun screenshot posté !**\nLes joueurs doivent d'abord poster le scoreboard dans {sb_mention} avant de pouvoir valider.",
-                ephemeral=True
-            )
-            return
-        await interaction.response.send_modal(ScoreModal(self.match_id, 1))
+    def get_vote_state(self) -> dict:
+        if self.match_id not in match_votes:
+            match_votes[self.match_id] = {"team1": set(), "team2": set(), "timeout_task": None}
+        return match_votes[self.match_id]
 
-    @discord.ui.button(label="🏆 Team 2 a gagné", style=discord.ButtonStyle.success, custom_id="win_team2")
-    async def team2_win(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.is_coach_or_admin(interaction):
-            await interaction.response.send_message("❌ Seul un **Admin** ou **Coach** peut valider le résultat.", ephemeral=True)
+    def build_vote_status(self, votes: dict) -> str:
+        t1 = len(votes["team1"])
+        t2 = len(votes["team2"])
+        bar1 = "🟩" * t1 + "⬜" * (VOTE_THRESHOLD - min(t1, VOTE_THRESHOLD))
+        bar2 = "🟦" * t2 + "⬜" * (VOTE_THRESHOLD - min(t2, VOTE_THRESHOLD))
+        return f"🏅 **Team 1** {bar1} {t1}/6\n🏅 **Team 2** {bar2} {t2}/6"
+
+    async def process_vote(self, interaction: discord.Interaction, team: int):
+        uid = str(interaction.user.id)
+        mid = self.match_id
+
+        if not self.is_player_in_match(uid) and not self.is_coach_or_admin(interaction):
+            await interaction.response.send_message("❌ Seuls les joueurs du match peuvent voter.", ephemeral=True)
             return
-        has_screenshot = await self.check_screenshot(interaction)
-        if not has_screenshot:
-            match = active_matches.get(self.match_id)
-            sb_id = match.get("scoreboard_channel") if match else None
-            sb_mention = f"<#{sb_id}>" if sb_id else "le channel scoreboard"
-            await interaction.response.send_message(
-                f"❌ **Aucun screenshot posté !**\nLes joueurs doivent d'abord poster le scoreboard dans {sb_mention} avant de pouvoir valider.",
+
+        votes = self.get_vote_state()
+        other_team = "team2" if team == 1 else "team1"
+        this_team = f"team{team}"
+
+        # Annuler vote précédent si existant
+        votes[other_team].discard(uid)
+        if uid in votes[this_team]:
+            votes[this_team].discard(uid)
+            await interaction.response.send_message(f"🔄 Vote annulé pour **Team {team}**.", ephemeral=True)
+            await self._update_vote_embed(interaction, votes)
+            return
+
+        votes[this_team].add(uid)
+        t1 = len(votes["team1"])
+        t2 = len(votes["team2"])
+
+        await interaction.response.send_message(
+            f"✅ Vote enregistré pour **Team {team}** ! ({t1 if team==1 else t2}/6)", ephemeral=True
+        )
+        await self._update_vote_embed(interaction, votes)
+
+        # Seuil atteint ?
+        if len(votes[this_team]) >= VOTE_THRESHOLD:
+            await self._finalize_by_vote(interaction, team, auto=False)
+        else:
+            # Lancer le timeout si pas encore fait
+            if votes["timeout_task"] is None:
+                votes["timeout_task"] = asyncio.create_task(
+                    self._vote_timeout(interaction.guild, interaction.channel, mid)
+                )
+
+    async def _update_vote_embed(self, interaction, votes):
+        try:
+            status = self.build_vote_status(votes)
+            await interaction.message.edit(content=status, view=self)
+        except Exception:
+            pass
+
+    async def _vote_timeout(self, guild, channel, match_id: str):
+        await asyncio.sleep(VOTE_TIMEOUT)
+        votes = match_votes.get(match_id, {})
+        t1 = len(votes.get("team1", set()))
+        t2 = len(votes.get("team2", set()))
+        if t1 == 0 and t2 == 0:
+            return  # Déjà résolu ou pas de votes
+        winner = 1 if t1 >= t2 else 2
+        try:
+            await channel.send(
+                f"⏰ **10 minutes écoulées** — Team {winner} gagne par majorité de votes ({t1 if winner==1 else t2} vs {t2 if winner==1 else t1}).\nScore enregistré par défaut : **13-0** (un admin peut corriger avec `/editscore`)."
+            )
+        except Exception:
+            pass
+        await finalize_match_by_vote(guild, match_id, winner, score_w=13, score_l=0)
+
+    async def _finalize_by_vote(self, interaction, winner: int, auto: bool = False):
+        votes = self.get_vote_state()
+        # Annuler timeout
+        if votes["timeout_task"]:
+            votes["timeout_task"].cancel()
+            votes["timeout_task"] = None
+        # Vider les votes pour éviter double-validation
+        votes["team1"].clear()
+        votes["team2"].clear()
+
+        if not auto:
+            await interaction.followup.send(
+                f"🗳️ **6 votes atteints !** Team {winner} gagne.\nEntre le score pour finaliser :",
                 ephemeral=True
             )
+            await interaction.followup.send_modal(ScoreModal(self.match_id, winner))
+
+    @discord.ui.button(label="✅ Team 1 a gagné", style=discord.ButtonStyle.success, custom_id="vote_team1")
+    async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Admin/coach → validation directe avec score
+        if self.is_coach_or_admin(interaction):
+            has_screenshot = await self.check_screenshot(interaction)
+            if not has_screenshot:
+                match = active_matches.get(self.match_id)
+                sb_id = match.get("scoreboard_channel") if match else None
+                sb_mention = f"<#{sb_id}>" if sb_id else "le channel scoreboard"
+                await interaction.response.send_message(
+                    f"❌ **Aucun screenshot posté !** Postez d'abord dans {sb_mention}.", ephemeral=True
+                )
+                return
+            await interaction.response.send_modal(ScoreModal(self.match_id, 1))
             return
-        await interaction.response.send_modal(ScoreModal(self.match_id, 2))
+        await self.process_vote(interaction, 1)
+
+    @discord.ui.button(label="✅ Team 2 a gagné", style=discord.ButtonStyle.success, custom_id="vote_team2")
+    async def team2_win(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.is_coach_or_admin(interaction):
+            has_screenshot = await self.check_screenshot(interaction)
+            if not has_screenshot:
+                match = active_matches.get(self.match_id)
+                sb_id = match.get("scoreboard_channel") if match else None
+                sb_mention = f"<#{sb_id}>" if sb_id else "le channel scoreboard"
+                await interaction.response.send_message(
+                    f"❌ **Aucun screenshot posté !** Postez d'abord dans {sb_mention}.", ephemeral=True
+                )
+                return
+            await interaction.response.send_modal(ScoreModal(self.match_id, 2))
+            return
+        await self.process_vote(interaction, 2)
 
 
 class ReportView(discord.ui.View):
@@ -1877,9 +1988,27 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
         # Catégorie visible par tout le monde
         cat = await guild.create_category(f"🎮 Match {match_id[-6:]}")
 
-        # Vocaux simples — pas de permissions complexes, le bot a admin donc ça passe toujours
-        vc1 = await guild.create_voice_channel("🔴 Team 1", category=cat)
-        vc2 = await guild.create_voice_channel("🔵 Team 2", category=cat)
+        # Permissions vocaux — seuls les joueurs de chaque équipe + staff peuvent rejoindre
+        def make_vc_overwrites(players_allowed):
+            ow = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, manage_channels=True),
+            }
+            if coach_role:
+                ow[coach_role] = discord.PermissionOverwrite(view_channel=True, connect=True)
+            for p in players_allowed:
+                if p.get("is_bot"):
+                    continue
+                try:
+                    member = guild.get_member(int(p["id"]))
+                    if member:
+                        ow[member] = discord.PermissionOverwrite(view_channel=True, connect=True)
+                except Exception:
+                    pass
+            return ow
+
+        vc1 = await guild.create_voice_channel("🔴 Team 1", category=cat, overwrites=make_vc_overwrites(team1))
+        vc2 = await guild.create_voice_channel("🔵 Team 2", category=cat, overwrites=make_vc_overwrites(team2))
         vc_coach = await guild.create_voice_channel("🎙️ Coach", category=cat)
 
         # Channel notes coach — privé (coach + admin seulement)
@@ -2079,7 +2208,8 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
     if active_matches[match_id].get("scoreboard_channel"):
         sc = guild.get_channel(active_matches[match_id]["scoreboard_channel"])
         if sc:
-            await sc.send(content=f"🎮 **Match lancé !** {mentions}", embed=embed, view=MatchResultView(match_id))
+            vote_msg = f"🗳️ **Votez pour l'équipe gagnante !** (6/10 votes requis — auto-résolution dans 10 min)\n⬜⬜⬜⬜⬜⬜ Team 1 — 0/6\n⬜⬜⬜⬜⬜⬜ Team 2 — 0/6"
+            await sc.send(content=f"🎮 **Match lancé !** {mentions}\n{vote_msg}", embed=embed, view=MatchResultView(match_id))
             await sc.send("**🛠️ Contrôles Admin :**", view=AdminMatchView(match_id))
     else:
         # Fallback sur le channel queue si pas de scoreboard
@@ -2087,6 +2217,15 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
         await interaction.channel.send("**🛠️ Contrôles Admin :**", view=AdminMatchView(match_id))
 
     await update_queue_message(guild=guild)
+
+
+async def finalize_match_by_vote(guild: discord.Guild, match_id: str, winner: int, score_w: int = 13, score_l: int = 0):
+    """Finalise un match validé par vote (sans interaction Discord)."""
+    match = active_matches.get(match_id)
+    if not match:
+        return
+    await finish_match(guild, match_id, winner, score_winner=score_w, score_loser=score_l)
+    match_votes.pop(match_id, None)
 
 
 async def finalize_match(interaction: discord.Interaction, match_id: str, winner: int, forced: bool = False, score_winner: int = 13, score_loser: int = 0):
@@ -4238,6 +4377,154 @@ async def reports_cmd(interaction: discord.Interaction):
     embed.description = "\n".join(f"<@{r['reported_id']}> — **{r['cnt']}** reports" for r in rows)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+
+
+# ─────────────────────────────────────────────
+#  COMMANDES GESTION MATCH EN COURS
+# ─────────────────────────────────────────────
+
+def find_player_match(uid: str) -> tuple[str, str] | tuple[None, None]:
+    """Retourne (match_id, team_key) pour un joueur en match actif, ou (None, None)."""
+    for mid, m in active_matches.items():
+        for team_key in ("team1", "team2"):
+            if any(p["id"] == uid for p in m[team_key]):
+                return mid, team_key
+    return None, None
+
+
+@tree.command(name="swapjoueurs", description="[ADMIN/COACH] Échanger deux joueurs entre les équipes")
+@app_commands.describe(joueur1="Premier joueur", joueur2="Deuxième joueur")
+async def swap_players_cmd(interaction: discord.Interaction, joueur1: discord.Member, joueur2: discord.Member):
+    if not (interaction.user.guild_permissions.administrator or
+            discord.utils.get(interaction.guild.roles, name="Coach") in interaction.user.roles):
+        await interaction.response.send_message("❌ Admin ou Coach uniquement.", ephemeral=True)
+        return
+
+    uid1, uid2 = str(joueur1.id), str(joueur2.id)
+    mid1, team1_key = find_player_match(uid1)
+    mid2, team2_key = find_player_match(uid2)
+
+    if not mid1 or not mid2:
+        await interaction.response.send_message("❌ Un des joueurs n'est pas dans un match actif.", ephemeral=True)
+        return
+    if mid1 != mid2:
+        await interaction.response.send_message("❌ Les deux joueurs ne sont pas dans le même match.", ephemeral=True)
+        return
+    if team1_key == team2_key:
+        await interaction.response.send_message("⚠️ Ces joueurs sont déjà dans la même équipe !", ephemeral=True)
+        return
+
+    match = active_matches[mid1]
+    # Trouver les objets joueur
+    p1 = next(p for p in match[team1_key] if p["id"] == uid1)
+    p2 = next(p for p in match[team2_key] if p["id"] == uid2)
+
+    # Swap
+    match[team1_key] = [p2 if p["id"] == uid1 else p for p in match[team1_key]]
+    match[team2_key] = [p1 if p["id"] == uid2 else p for p in match[team2_key]]
+
+    # Mettre à jour les rôles vocaux
+    try:
+        vc1 = interaction.guild.get_channel(match["channels"][1])
+        vc2 = interaction.guild.get_channel(match["channels"][2])
+        m1 = interaction.guild.get_member(int(uid1))
+        m2 = interaction.guild.get_member(int(uid2))
+        if m1 and vc2 and m1.voice:
+            await m1.move_to(vc2)
+        if m2 and vc1 and m2.voice:
+            await m2.move_to(vc1)
+    except Exception:
+        pass
+
+    # Notifier dans le channel scoreboard
+    sb_ch = interaction.guild.get_channel(match.get("scoreboard_channel")) if match.get("scoreboard_channel") else None
+    msg = f"🔄 **Swap effectué** par {interaction.user.mention}\n**{joueur1.display_name}** ↔ **{joueur2.display_name}**"
+    if sb_ch:
+        await sb_ch.send(msg)
+    # Mettre à jour les permissions vocaux
+    try:
+        vc1_ch = interaction.guild.get_channel(match["channels"][1])
+        vc2_ch = interaction.guild.get_channel(match["channels"][2])
+        m1 = interaction.guild.get_member(int(uid1))
+        m2 = interaction.guild.get_member(int(uid2))
+        if vc1_ch and m1 and m2:
+            # p1 est maintenant dans team2, p2 dans team1
+            await vc1_ch.set_permissions(m1, overwrite=None)
+            await vc1_ch.set_permissions(m2, connect=True, view_channel=True)
+            await vc2_ch.set_permissions(m2, overwrite=None)
+            await vc2_ch.set_permissions(m1, connect=True, view_channel=True)
+    except Exception:
+        pass
+    await interaction.response.send_message(
+        f"✅ {joueur1.display_name} et {joueur2.display_name} ont été échangés !",
+        ephemeral=True
+    )
+
+
+@tree.command(name="remplacer", description="[ADMIN/COACH] Remplacer un joueur AFK par un sub")
+@app_commands.describe(joueur="Joueur à remplacer (AFK)", sub="Joueur remplaçant")
+async def replace_player_cmd(interaction: discord.Interaction, joueur: discord.Member, sub: discord.Member):
+    if not (interaction.user.guild_permissions.administrator or
+            discord.utils.get(interaction.guild.roles, name="Coach") in interaction.user.roles):
+        await interaction.response.send_message("❌ Admin ou Coach uniquement.", ephemeral=True)
+        return
+
+    uid_out = str(joueur.id)
+    uid_in  = str(sub.id)
+
+    # Vérif sub pas déjà en match
+    mid_sub, _ = find_player_match(uid_in)
+    if mid_sub:
+        await interaction.response.send_message("❌ Le sub est déjà dans un match actif.", ephemeral=True)
+        return
+
+    mid, team_key = find_player_match(uid_out)
+    if not mid:
+        await interaction.response.send_message("❌ Ce joueur n'est pas dans un match actif.", ephemeral=True)
+        return
+
+    match = active_matches[mid]
+    old_player = next(p for p in match[team_key] if p["id"] == uid_out)
+
+    # Remplacer dans la liste
+    match[team_key] = [
+        {"id": uid_in, "name": sub.display_name, "role": old_player.get("role", "?")}
+        if p["id"] == uid_out else p
+        for p in match[team_key]
+    ]
+
+    # Déplacer le sub dans le vocal de l'équipe si possible
+    try:
+        vc_idx = 1 if team_key == "team1" else 2
+        vc = interaction.guild.get_channel(match["channels"][vc_idx])
+        sub_member = interaction.guild.get_member(int(uid_in))
+        if sub_member and vc and sub_member.voice:
+            await sub_member.move_to(vc)
+    except Exception:
+        pass
+
+    # Notifier dans scoreboard
+    sb_ch = interaction.guild.get_channel(match.get("scoreboard_channel")) if match.get("scoreboard_channel") else None
+    msg = f"🔁 **Remplacement** par {interaction.user.mention}\n**{joueur.display_name}** → **{sub.display_name}** (sub)"
+    if sb_ch:
+        await sb_ch.send(msg)
+    # Mettre à jour les permissions vocaux
+    try:
+        vc_idx = 1 if team_key == "team1" else 2
+        vc_ch = interaction.guild.get_channel(match["channels"][vc_idx])
+        old_member = interaction.guild.get_member(int(uid_out))
+        new_member = interaction.guild.get_member(int(uid_in))
+        if vc_ch:
+            if old_member:
+                await vc_ch.set_permissions(old_member, overwrite=None)
+            if new_member:
+                await vc_ch.set_permissions(new_member, connect=True, view_channel=True)
+    except Exception:
+        pass
+    await interaction.response.send_message(
+        f"✅ **{joueur.display_name}** remplacé par **{sub.display_name}** !",
+        ephemeral=True
+    )
 
 # ─────────────────────────────────────────────
 #  TASK : synchro rangs Riot quotidienne
