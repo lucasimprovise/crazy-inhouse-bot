@@ -1260,9 +1260,33 @@ async def ping_queue_watchers(guild: discord.Guild, joiner_uid: str, joiner_name
                 mentions.append(member.mention)
         conn_n.close()
 
-    mention_str = " ".join(mentions) if mentions else ""
+    # Envoyer l'embed + mentions en respectant la limite Discord de 2000 chars
+    # Si trop de mentions, on les découpe en plusieurs messages silencieux
     try:
-        await chat_ch.send(content=mention_str or None, embed=embed)
+        if not mentions:
+            await chat_ch.send(content=None, embed=embed)
+        else:
+            # Premier message : embed + premières mentions
+            chunk = []
+            first = True
+            for mention in mentions:
+                chunk.append(mention)
+                test_str = " ".join(chunk)
+                if len(test_str) > 1800:
+                    # Envoyer ce chunk
+                    if first:
+                        await chat_ch.send(content=" ".join(chunk[:-1]) or None, embed=embed)
+                        first = False
+                    else:
+                        await chat_ch.send(content=" ".join(chunk[:-1]))
+                    chunk = [mention]
+            # Dernier chunk restant
+            if chunk:
+                remaining = " ".join(chunk)
+                if first:
+                    await chat_ch.send(content=remaining, embed=embed)
+                else:
+                    await chat_ch.send(content=remaining)
     except Exception as e:
         print(f"[PING] Erreur envoi chat {queue_id}: {e}")
 
