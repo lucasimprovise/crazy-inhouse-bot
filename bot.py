@@ -1177,6 +1177,7 @@ QUEUE_ROLES = {
     "radiant":      "Queue Radiant",
     "ascendant":    "Queue Ascendant",
     "gamechangers": "Queue GC",
+    "immortal":     "Queue Immortal",
 }
 
 def get_notif_queues(row) -> set:
@@ -1235,9 +1236,28 @@ async def ping_queue_watchers(guild: discord.Guild, joiner_uid: str, joiner_name
     embed = discord.Embed(title=title, description=desc, color=q_info["color"])
     embed.set_footer(text="Rejoins depuis le salon queue • /notifications pour tes alertes DM")
 
-    mention = required_role.mention if required_role else ""
+    # Construire les mentions individuelles en respectant les préférences /notifications
+    # On ne mentionne que les membres qui ont activé les notifs pour cette queue
+    mentions = []
+    if required_role:
+        conn_n = get_db()
+        for member in required_role.members:
+            mid_str = str(member.id)
+            # Ne pas pinger le joueur qui vient de rejoindre (il est déjà en queue)
+            if mid_str == joiner_uid:
+                continue
+            row_n = conn_n.execute(
+                "SELECT notif_enabled, notif_queues FROM player_channels WHERE discord_id=?",
+                (mid_str,)
+            ).fetchone()
+            active_queues = get_notif_queues(row_n)
+            if queue_id in active_queues:
+                mentions.append(member.mention)
+        conn_n.close()
+
+    mention_str = " ".join(mentions) if mentions else ""
     try:
-        await chat_ch.send(content=mention, embed=embed)
+        await chat_ch.send(content=mention_str or None, embed=embed)
     except Exception as e:
         print(f"[PING] Erreur envoi chat {queue_id}: {e}")
 
@@ -3234,6 +3254,11 @@ async def init_server_cmd(interaction: discord.Interaction):
                 "**Bienvenue !** Ce serveur est sur **candidature**.\n\n"
                 "Pour accéder au serveur, clique sur le bouton ci-dessous et remplis le formulaire.\n"
                 "Un admin examinera ta candidature et te donnera accès si elle est acceptée.\n\n"
+                "**Les queues disponibles :**\n"
+                "👑 **Radiant / Immo3** — niveau pro / ex-pro / top radiant\n"
+                "⚔️ **Immo+** — Immortel 1/2/3 et plus\n"
+                "💎 **Ascendant / Immo** — niveau haut, cadre sérieux\n"
+                "🌸 **Game Changers** — réservée aux joueuses\n\n"
                 "**Ce qu'on recherche :**\n"
                 "• Joueurs sérieux et fair-play\n"
                 "• Niveau Ascendant minimum (ou Game Changers)\n"
