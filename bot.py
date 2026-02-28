@@ -1183,8 +1183,12 @@ QUEUE_ROLES = {
 def get_notif_queues(row) -> set:
     """Retourne les queues pour lesquelles les notifs sont activées. None = toutes."""
     import json as _json
-    if not row or row["notif_enabled"] == 0:
-        return set()  # notifs globalement désactivées
+    # Pas de ligne en DB = notifs ON par défaut (joueur n'a jamais touché à /notifications)
+    if not row:
+        return set(QUEUES.keys())
+    # Notifs globalement désactivées
+    if row["notif_enabled"] == 0:
+        return set()
     raw = row["notif_queues"] if row["notif_queues"] else None
     if raw is None:
         return set(QUEUES.keys())  # toutes par défaut
