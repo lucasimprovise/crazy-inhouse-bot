@@ -1215,15 +1215,16 @@ async def ping_queue_watchers(guild: discord.Guild, joiner_uid: str, joiner_name
     if not should_ping_first and not should_ping_mid:
         return
 
-    # Récupère le rôle requis pour mentionner
+    # Récupère le rôle requis pour mentionner (pas bloquant si absent)
     required_role_name = QUEUE_ROLES.get(queue_id)
     required_role = discord.utils.get(guild.roles, name=required_role_name) if required_role_name else None
     if required_role_name and not required_role:
-        return
+        print(f"[PING] Rôle '{required_role_name}' introuvable sur le serveur, ping sans mentions")
 
     # Récupère le salon chat
     chat_ch = get_queue_chat_channel(guild, queue_id)
     if not chat_ch:
+        print(f"[PING] Salon chat introuvable pour queue '{queue_id}'")
         return
 
     # Construit le message
