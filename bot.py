@@ -4417,6 +4417,182 @@ async def addcosmetic_cmd(
     )
 
 
+@tree.command(name="recalculstats", description="[ADMIN] Recalculer tous les stats depuis l'historique des matchs")
+@app_commands.describe(confirmer="Tapez 'oui' pour appliquer, laisser vide pour simulation")
+async def recalcul_stats_cmd(interaction: discord.Interaction, confirmer: str = "non"):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+
+    dry_run = confirmer.lower() != "oui"
+    await interaction.response.defer(ephemeral=True)
+
+    import json as _json
+    from collections import defaultdict
+
+    conn = get_db()
+
+    # Récupérer tous les matchs finished dans l'ordre chronologique
+    matches = conn.execute(
+        "SELECT * FROM matches WHERE status='finished' ORDER BY ended_at ASC"
+    ).fetchall()
+
+    if not matches:
+        await interaction.followup.send("❌ Aucun match terminé en DB.", ephemeral=True)
+        conn.close()
+        return
+
+    players_db = conn.execute("SELECT * FROM players").fetchall()
+
+    # Remettre tout à zéro en mémoire
+    state = {}
+    for p in players_db:
+        state[p["discord_id"]] = {
+            "wins": 0, "losses": 0, "elo": 1000,
+            "streak": 0, "best_streak": 0,
+            "points": 0,
+            "mvp_count": p["mvp_count"] or 0,
+        }
+
+    queue_state = defaultdict(lambda: defaultdict(lambda: {
+        "wins": 0, "losses": 0, "elo": 1000,
+        "streak": 0, "best_streak": 0, "placement_done": 0
+    }))
+
+    def _calc_elo(winner_elo, loser_elo, k=K_FACTOR):
+        expected = 1 / (1 + 10 ** ((loser_elo - winner_elo) / 400))
+        return round(k * (1 - expected)), round(k * expected)
+
+    def _k(wins, losses):
+        return K_FACTOR_PLACEMENT if (wins + losses) < PLACEMENT_MATCHES else K_FACTOR
+
+    def _mult(sw, sl):
+        total = (sw or 13) + (sl or 0)
+        if total <= 0: return 1.0
+        d = (sw or 13) / total
+        return max(0.75, min(1.35, round(0.5 + d, 2)))
+
+    skipped = processed = 0
+
+    for m in matches:
+        try:
+            t1_raw = _json.loads(m["team1"])
+            t2_raw = _json.loads(m["team2"])
+        except Exception:
+            skipped += 1
+            continue
+
+        def ids(raw):
+            out = []
+            for p in raw:
+                if isinstance(p, dict):
+                    out.append(str(p.get("id") or p.get("discord_id", "")))
+                else:
+                    out.append(str(p))
+            return [i for i in out if i]
+
+        t1 = ids(t1_raw)
+        t2 = ids(t2_raw)
+        if not t1 or not t2:
+            skipped += 1
+            continue
+
+        winners = t1 if m["winner"] == 1 else t2
+        losers  = t2 if m["winner"] == 1 else t1
+        qid     = m["queue_id"] or "ascendant"
+        mult    = _mult(m["score_winner"], m["score_loser"])
+
+        for uid in t1 + t2:
+            if uid not in state:
+                state[uid] = {"wins": 0, "losses": 0, "elo": 1000,
+                              "streak": 0, "best_streak": 0, "points": 0, "mvp_count": 0}
+
+        avg_w = sum(queue_state[u][qid]["elo"] for u in winners) / len(winners)
+        avg_l = sum(queue_state[u][qid]["elo"] for u in losers)  / len(losers)
+
+        for uid in winners:
+            s, qs = state[uid], queue_state[uid][qid]
+            gain, _ = _calc_elo(int(avg_w), int(avg_l), _k(qs["wins"], qs["losses"]))
+            gain = round(gain * mult)
+            s["elo"] += gain; s["wins"] += 1; s["points"] += POINTS_WIN
+            s["streak"] += 1; s["best_streak"] = max(s["best_streak"], s["streak"])
+            qs["elo"] = s["elo"]; qs["wins"] += 1
+            qs["streak"] += 1; qs["best_streak"] = max(qs["best_streak"], qs["streak"])
+            qs["placement_done"] = 1 if (qs["wins"] + qs["losses"]) >= PLACEMENT_MATCHES else 0
+
+        for uid in losers:
+            s, qs = state[uid], queue_state[uid][qid]
+            _, loss = _calc_elo(int(avg_w), int(avg_l), _k(qs["wins"], qs["losses"]))
+            loss = round(loss * mult)
+            s["elo"] = max(100, s["elo"] - loss); s["losses"] += 1; s["points"] += POINTS_LOSS
+            s["streak"] = 0
+            qs["elo"] = s["elo"]; qs["losses"] += 1; qs["streak"] = 0
+            qs["placement_done"] = 1 if (qs["wins"] + qs["losses"]) >= PLACEMENT_MATCHES else 0
+
+        processed += 1
+
+    # Construire le rapport
+    diffs = []
+    for p in players_db:
+        uid = p["discord_id"]
+        if uid not in state:
+            continue
+        s = state[uid]
+        dw = s["wins"]   - (p["wins"]   or 0)
+        dl = s["losses"] - (p["losses"] or 0)
+        de = s["elo"]    - (p["elo"]    or 1000)
+        if dw != 0 or dl != 0:
+            sign_w = f"+{dw}" if dw > 0 else str(dw)
+            sign_l = f"+{dl}" if dl > 0 else str(dl)
+            sign_e = f"+{de}" if de > 0 else str(de)
+            diffs.append(f"**{p['username']}** : W {sign_w} | L {sign_l} | ELO {sign_e}")
+
+    # Appliquer si pas dry-run
+    if not dry_run:
+        for uid, s in state.items():
+            conn.execute(
+                "UPDATE players SET wins=?, losses=?, elo=?, streak=?, best_streak=?, points=? WHERE discord_id=?",
+                (s["wins"], s["losses"], s["elo"], s["streak"], s["best_streak"], s["points"], uid)
+            )
+        for uid, queues in queue_state.items():
+            for qid2, qs in queues.items():
+                conn.execute(
+                    "UPDATE player_queue_elo SET wins=?, losses=?, elo=?, streak=?, best_streak=?, placement_done=? WHERE discord_id=? AND queue_id=?",
+                    (qs["wins"], qs["losses"], qs["elo"], qs["streak"], qs["best_streak"], qs["placement_done"], uid, qid2)
+                )
+        conn.commit()
+
+    conn.close()
+
+    prefix = "🔍 **[SIMULATION]**" if dry_run else "✅ **[APPLIQUÉ]**"
+    intro = (
+        f"{prefix} Recalcul depuis **{processed}** matchs ({skipped} ignorés)\n\n"
+        f"{'Joueurs avec des différences :' if diffs else '✅ Aucune différence détectée — stats déjà correctes !'}"
+    )
+
+    if diffs:
+        # Envoyer par chunks si trop long
+        chunks = [intro]
+        current = ""
+        for line in diffs:
+            if len(current) + len(line) > 1800:
+                chunks.append(current)
+                current = line + "\n"
+            else:
+                current += line + "\n"
+        if current:
+            chunks.append(current)
+
+        for chunk in chunks:
+            await interaction.followup.send(chunk, ephemeral=True)
+    else:
+        await interaction.followup.send(intro, ephemeral=True)
+
+    if dry_run and diffs:
+        await interaction.followup.send(
+            "💡 Pour appliquer : `/recalculstats confirmer:oui`", ephemeral=True
+        )
+
 @tree.command(name="editstats", description="[ADMIN] Corriger les stats d'un joueur")
 @app_commands.describe(
     user="Joueur à corriger",
