@@ -1878,6 +1878,18 @@ class MatchResultView(discord.ui.View):
             await interaction.response.send_message("❌ Seuls les joueurs du match peuvent voter.", ephemeral=True)
             return
 
+        # Vérifier qu'un screenshot a été posté avant de permettre le vote
+        has_screenshot = await self.check_screenshot(interaction)
+        if not has_screenshot:
+            match = active_matches.get(self.match_id)
+            sb_id = match.get("scoreboard_channel") if match else None
+            sb_mention = f"<#{sb_id}>" if sb_id else "le salon scoreboard"
+            await interaction.response.send_message(
+                f"❌ **Aucun screenshot posté !** Postez d'abord le scoreboard dans {sb_mention} avant de voter.",
+                ephemeral=True
+            )
+            return
+
         votes = self.get_vote_state()
         other_team = "team2" if team == 1 else "team1"
         this_team = f"team{team}"
@@ -1922,11 +1934,14 @@ class MatchResultView(discord.ui.View):
 
     async def _vote_timeout(self, guild, channel, match_id: str):
         await asyncio.sleep(VOTE_TIMEOUT)
+        # Si le match a déjà été finalisé (par admin ou vote), ne rien faire
+        if match_id not in active_matches:
+            return
         votes = match_votes.get(match_id, {})
         t1 = len(votes.get("team1", set()))
         t2 = len(votes.get("team2", set()))
         if t1 == 0 and t2 == 0:
-            return  # Déjà résolu ou pas de votes
+            return  # Pas de votes du tout, on ignore
         winner = 1 if t1 >= t2 else 2
         try:
             await channel.send(
@@ -2441,7 +2456,8 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
 
 async def finalize_match_by_vote(guild: discord.Guild, match_id: str, winner: int, score_w: int = 13, score_l: int = 0):
     """Finalise un match validé par vote (sans interaction Discord)."""
-    match = active_matches.get(match_id)
+    # Pop immédiatement pour éviter le double-traitement (timeout + vote simultanés)
+    match = active_matches.pop(match_id, None)
     if not match:
         return
     await finish_match(guild, match_id, winner, score_winner=score_w, score_loser=score_l)
@@ -2449,7 +2465,8 @@ async def finalize_match_by_vote(guild: discord.Guild, match_id: str, winner: in
 
 
 async def finalize_match(interaction: discord.Interaction, match_id: str, winner: int, forced: bool = False, score_winner: int = 13, score_loser: int = 0):
-    match = active_matches.get(match_id)
+    # Pop immédiatement pour éviter le double-traitement si deux personnes valident en même temps
+    match = active_matches.pop(match_id, None)
     if not match:
         return
 
@@ -2647,7 +2664,7 @@ async def finalize_match(interaction: discord.Interaction, match_id: str, winner
 
     await update_leaderboard(guild)
     await update_stats_counter(guild)
-    del active_matches[match_id]
+    # active_matches[match_id] déjà retiré en début de fonction (pop)
 
     # Mettre à jour les embeds personnels immédiatement
     try:
@@ -4399,6 +4416,84 @@ async def addcosmetic_cmd(
         ephemeral=True
     )
 
+
+@tree.command(name="editstats", description="[ADMIN] Corriger les stats d'un joueur")
+@app_commands.describe(
+    user="Joueur à corriger",
+    wins="Ajustement victoires (ex: -1 pour enlever une win)",
+    losses="Ajustement défaites (ex: -1 pour enlever une lose)",
+    elo="Ajustement ELO (ex: -25 pour enlever 25 ELO)",
+    queue="Queue concernée (laisser vide = stats globales)"
+)
+@app_commands.choices(queue=[
+    app_commands.Choice(name="👑 Radiant / Immo3", value="radiant"),
+    app_commands.Choice(name="⚔️ Immo+", value="immortal"),
+    app_commands.Choice(name="💎 Ascendant / Immo", value="ascendant"),
+    app_commands.Choice(name="🌸 Game Changers", value="gamechangers"),
+])
+async def editstats_cmd(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    wins: int = 0,
+    losses: int = 0,
+    elo: int = 0,
+    queue: str = None
+):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+
+    uid = str(user.id)
+    conn = get_db()
+
+    if queue:
+        # Modifier les stats d'une queue spécifique
+        row = conn.execute(
+            "SELECT elo, wins, losses FROM player_queue_elo WHERE discord_id=? AND queue_id=?",
+            (uid, queue)
+        ).fetchone()
+        if not row:
+            conn.close()
+            await interaction.response.send_message(
+                f"❌ **{user.display_name}** n'a pas de stats pour cette queue.", ephemeral=True
+            )
+            return
+        new_elo   = max(0, row["elo"]   + elo)
+        new_wins  = max(0, row["wins"]  + wins)
+        new_losses= max(0, row["losses"]+ losses)
+        conn.execute(
+            "UPDATE player_queue_elo SET elo=?, wins=?, losses=? WHERE discord_id=? AND queue_id=?",
+            (new_elo, new_wins, new_losses, uid, queue)
+        )
+        scope = f"queue **{QUEUES[queue]['name']}**"
+        summary = f"ELO: {row['elo']} → **{new_elo}** | W: {row['wins']} → **{new_wins}** | L: {row['losses']} → **{new_losses}**"
+    else:
+        # Modifier les stats globales
+        row = conn.execute(
+            "SELECT elo, wins, losses FROM players WHERE discord_id=?", (uid,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            await interaction.response.send_message(
+                f"❌ **{user.display_name}** n'est pas inscrit.", ephemeral=True
+            )
+            return
+        new_elo   = max(0, row["elo"]   + elo)
+        new_wins  = max(0, row["wins"]  + wins)
+        new_losses= max(0, row["losses"]+ losses)
+        conn.execute(
+            "UPDATE players SET elo=?, wins=?, losses=? WHERE discord_id=?",
+            (new_elo, new_wins, new_losses, uid)
+        )
+        scope = "stats globales"
+        summary = f"ELO: {row['elo']} → **{new_elo}** | W: {row['wins']} → **{new_wins}** | L: {row['losses']} → **{new_losses}**"
+
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(
+        f"✅ Stats de **{user.display_name}** mises à jour ({scope})\n{summary}",
+        ephemeral=True
+    )
 
 @tree.command(name="donnerpoints", description="[ADMIN] Donner des points à un joueur")
 @app_commands.describe(user="Joueur", points="Nombre de points")
