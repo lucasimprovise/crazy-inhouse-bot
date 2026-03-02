@@ -1967,6 +1967,10 @@ class MatchResultView(discord.ui.View):
 
     @discord.ui.button(label="✅ Team 1 a gagné", style=discord.ButtonStyle.success, custom_id="vote_team1")
     async def team1_win(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Match déjà finalisé
+        if self.match_id not in active_matches:
+            await interaction.response.send_message("✅ Ce match est déjà terminé.", ephemeral=True)
+            return
         # Admin/coach → validation directe avec score
         if self.is_coach_or_admin(interaction):
             has_screenshot = await self.check_screenshot(interaction)
@@ -1984,6 +1988,10 @@ class MatchResultView(discord.ui.View):
 
     @discord.ui.button(label="✅ Team 2 a gagné", style=discord.ButtonStyle.success, custom_id="vote_team2")
     async def team2_win(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Match déjà finalisé
+        if self.match_id not in active_matches:
+            await interaction.response.send_message("✅ Ce match est déjà terminé.", ephemeral=True)
+            return
         if self.is_coach_or_admin(interaction):
             has_screenshot = await self.check_screenshot(interaction)
             if not has_screenshot:
