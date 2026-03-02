@@ -4499,7 +4499,7 @@ async def recalcul_stats_cmd(interaction: discord.Interaction, confirmer: str = 
 
         winners = t1 if m["winner"] == 1 else t2
         losers  = t2 if m["winner"] == 1 else t1
-        qid     = m["queue_id"] or "ascendant"
+        qid     = (dict(m).get("queue_id") or "ascendant")
         mult    = _mult(m["score_winner"], m["score_loser"])
 
         for uid in t1 + t2:
