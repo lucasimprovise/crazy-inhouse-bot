@@ -240,10 +240,24 @@ def init_db():
             notifs_channel  INTEGER,
             history_channel INTEGER
         );
+        CREATE TABLE IF NOT EXISTS bans (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id  TEXT NOT NULL,
+            reason      TEXT,
+            banned_by   TEXT DEFAULT 'AUTO',
+            expires_at  TEXT NOT NULL,
+            created_at  TEXT DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS follows (
             follower_id  TEXT NOT NULL,
             followed_id  TEXT NOT NULL,
             PRIMARY KEY (follower_id, followed_id)
+        );
+        CREATE TABLE IF NOT EXISTS blacklists (
+            blocker_id   TEXT NOT NULL,
+            blocked_id   TEXT NOT NULL,
+            created_at   TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (blocker_id, blocked_id)
         );
         CREATE TABLE IF NOT EXISTS cosmetics (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -912,21 +926,48 @@ def balance_teams(players: list[dict]) -> tuple[list, list]:
             elos[p["id"]] = internal_elo
     conn.close()
 
-    best_diff = float("inf")
-    best_splits = []  # Toutes les combinaisons au même écart minimum
-    ids = [p["id"] for p in players]
+    # Charger les blacklists pour ces joueurs
+    ids_set = list(set(p["id"] for p in players))
+    conn2 = get_db()
+    placeholders = ",".join("?" * len(ids_set))
+    bl_rows = conn2.execute(
+        f"SELECT blocker_id, blocked_id FROM blacklists WHERE blocker_id IN ({placeholders}) AND blocked_id IN ({placeholders})",
+        ids_set + ids_set
+    ).fetchall()
+    conn2.close()
+    avoid_pairs = set()
+    for r in bl_rows:
+        avoid_pairs.add(tuple(sorted([r["blocker_id"], r["blocked_id"]])))
 
-    for combo in combinations(range(10), 5):
+    def conflict_score(team_ids):
+        score = 0
+        tl = list(team_ids)
+        for i in range(len(tl)):
+            for j in range(i+1, len(tl)):
+                if tuple(sorted([tl[i], tl[j]])) in avoid_pairs:
+                    score += 1
+        return score
+
+    best_diff = float("inf")
+    best_conflict = float("inf")
+    best_splits = []
+    ids = [p["id"] for p in players]
+    n = len(ids)
+    half = n // 2
+
+    for combo in combinations(range(n), half):
         t1_ids = [ids[i] for i in combo]
-        t2_ids = [ids[i] for i in range(10) if i not in combo]
+        t2_ids = [ids[i] for i in range(n) if i not in combo]
         diff = abs(sum(elos[i] for i in t1_ids) - sum(elos[i] for i in t2_ids))
-        if diff < best_diff:
+        conflict = conflict_score(t1_ids) + conflict_score(t2_ids)
+        if conflict < best_conflict or (conflict == best_conflict and diff < best_diff):
             best_diff = diff
+            best_conflict = conflict
             best_splits = [(t1_ids, t2_ids)]
-        elif diff == best_diff:
+        elif conflict == best_conflict and diff == best_diff:
             best_splits.append((t1_ids, t2_ids))
 
-    # Choisir aléatoirement parmi les splits optimaux → équipes différentes à chaque fois
+    # Choisir aléatoirement parmi les splits optimaux
     best_split = random.choice(best_splits)
 
     id_to_player = {p["id"]: p for p in players}
@@ -1577,6 +1618,18 @@ class QueueSelectDropdown(discord.ui.Select):
 
 async def _join_queue(interaction: discord.Interaction, uid: str, username: str, role: str, queue_id: str):
     """Ajoute un joueur à une queue spécifique et déclenche le match si plein."""
+    # Vérifier ban actif
+    conn_ban = get_db()
+    ban_row = conn_ban.execute(
+        "SELECT expires_at FROM bans WHERE discord_id=? AND expires_at > datetime('now')", (uid,)
+    ).fetchone()
+    conn_ban.close()
+    if ban_row:
+        await interaction.response.send_message(
+            f"🔨 Tu es banni des queues jusqu'au **{ban_row['expires_at']} UTC**.", ephemeral=True
+        )
+        return
+
     q_info = QUEUES[queue_id]
     queues[queue_id].append({
         "id": uid, "name": username, "role": role,
@@ -2040,15 +2093,39 @@ class ReportSelect(discord.ui.Select):
             "SELECT COUNT(*) as cnt FROM reports WHERE reported_id = ? AND created_at > datetime('now', '-7 days')",
             (reported,)
         ).fetchone()["cnt"]
+
+        # Ban automatique si seuil atteint et pas déjà banni
+        BAN_HOURS = 24
+        already_banned = conn.execute(
+            "SELECT id FROM bans WHERE discord_id=? AND expires_at > datetime('now')", (reported,)
+        ).fetchone()
+        ban_applied = False
+        if count >= REPORT_THRESHOLD and not already_banned:
+            conn.execute(
+                "INSERT INTO bans (discord_id, reason, banned_by, expires_at) VALUES (?, ?, 'AUTO', datetime('now', ?))",
+                (reported, f"{count} reports en 7 jours (match {self.match_id})", f"+{BAN_HOURS} hours")
+            )
+            conn.commit()
+            ban_applied = True
+
         conn.close()
         await interaction.response.send_message("✅ Report envoyé.", ephemeral=True)
 
-        if count >= REPORT_THRESHOLD:
-            guild = interaction.guild
-            for ch in guild.text_channels:
-                if any(x in ch.name.lower() for x in ["admin", "staff", "mod"]):
-                    await ch.send(f"⚠️ **Alert Report** : <@{reported}> a reçu **{count} reports** en 7 jours. Match : `{self.match_id}`")
-                    break
+        guild = interaction.guild
+        log_ch = None
+        for ch in guild.text_channels:
+            if any(x in ch.name.lower() for x in ["admin", "staff", "mod"]):
+                log_ch = ch
+                break
+        if log_ch:
+            if ban_applied:
+                await log_ch.send(
+                    f"🔨 **Ban automatique** : <@{reported}> banni **{BAN_HOURS}h** suite à {count} reports.\nMatch : `{self.match_id}`"
+                )
+            elif count >= REPORT_THRESHOLD - 1:
+                await log_ch.send(
+                    f"⚠️ **Alert Report** : <@{reported}> a reçu **{count} reports** en 7 jours. Match : `{self.match_id}`"
+                )
 
 
 class AdminMatchView(discord.ui.View):
@@ -2181,7 +2258,6 @@ class MapVetoView(discord.ui.View):
 async def start_match(interaction: discord.Interaction, queue_id: str = None, guild_override: discord.Guild = None):
     # Déterminer quelle queue utiliser
     if queue_id is None:
-        # Legacy: prendre la première queue non vide
         queue_id = next((qid for qid, q in queues.items() if q), None)
         if not queue_id:
             return
@@ -2194,36 +2270,47 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
         if other_qid != queue_id:
             queues[other_qid] = [p for p in other_q if p["id"] not in match_uids]
 
-    # En mode test avec moins de 10 joueurs, on split simplement en 2
-    if len(players) < QUEUE_SIZE:
-        mid = len(players) // 2
-        team1 = players[:mid]
-        team2 = players[mid:]
-    else:
-        team1, team2 = balance_teams(players)
-    match_id = f"match_{int(datetime.now(timezone.utc).timestamp())}"
-    chosen_map = "🗺️ Veto en cours..."  # Sera défini par le veto
-    season = get_current_season()
+    guild = guild_override or interaction.guild
 
-    q_info = QUEUES.get(queue_id, list(QUEUES.values())[0])
+    # ── READY CHECK : 2 min pour confirmer ──────────────────────────────
+    ready_id = f"ready_{int(datetime.now(timezone.utc).timestamp())}"
+    mentions = " ".join(f"<@{p['id']}>" for p in players if not p.get("is_bot"))
+    total = len(players)
+    embed_rc = discord.Embed(
+        title="🎮 Match trouvé — Confirme ta présence !",
+        description=(
+            f"{'⬜' * total} **0/{total}**\n\n"
+            f"Tu as **{READY_TIMEOUT // 60} minutes** pour cliquer ✅\n"
+            "Les absents seront exclus du match."
+        ),
+        color=0xff4655
+    )
+    rc_msg = await interaction.channel.send(content=mentions, embed=embed_rc, view=ReadyCheckView(ready_id=ready_id))
+    ready_checks[ready_id] = {
+        "players": players,
+        "confirmed": set(),
+        "msg_id": rc_msg.id,
+        "channel_id": rc_msg.channel.id,
+        "queue_id": queue_id,
+        "task": None,
+    }
+    task = asyncio.create_task(_ready_timeout(guild, ready_id))
+    ready_checks[ready_id]["task"] = task
 
+
+async def _build_match_channels(guild: discord.Guild, match_id: str, team1: list, team2: list, q_info: dict, queue_id: str, src_channel):
+    """Crée les salons vocaux/texte pour un match et envoie l'embed de résultat."""
     def avg_elo(team):
         elos = [get_queue_elo(p["id"], queue_id)["elo"] for p in team]
         return round(sum(elos) / len(elos))
     elo_t1 = avg_elo(team1)
     elo_t2 = avg_elo(team2)
+    chosen_map = active_matches[match_id]["map"]
+    season = get_current_season()
 
-    active_matches[match_id] = {"team1": team1, "team2": team2, "votes": {}, "channels": [], "map": chosen_map, "queue_id": queue_id}
+    # Stub interaction-like object for the scoreboard channel send
+    interaction = type("FakeInteraction", (), {"channel": src_channel, "guild": guild})()
 
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO matches (match_id, team1, team2, map, status, season) VALUES (?, ?, ?, ?, 'active', ?)",
-        (match_id, json.dumps([p["id"] for p in team1]), json.dumps([p["id"] for p in team2]), chosen_map, season)
-    )
-    conn.commit()
-    conn.close()
-
-    guild = guild_override or interaction.guild
     try:
         coach_role = discord.utils.get(guild.roles, name="Coach")
         scout_role = discord.utils.get(guild.roles, name="Scout")
@@ -2460,6 +2547,7 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
         await interaction.channel.send("**🛠️ Contrôles Admin :**", view=AdminMatchView(match_id))
 
     await update_queue_message(guild=guild)
+
 
 
 async def finalize_match_by_vote(guild: discord.Guild, match_id: str, winner: int, score_w: int = 13, score_l: int = 0):
@@ -2721,13 +2809,30 @@ async def cancel_match_logic(interaction: discord.Interaction, match_id: str):
 
 
 async def cleanup_channels(guild: discord.Guild, match: dict):
-    for ch_id in match.get("channels", []):
+    ch_ids = match.get("channels", [])
+    if not ch_ids:
+        return
+
+    # Séparer catégorie (index 0) et salons enfants — supprimer les salons D'ABORD
+    # sinon Discord refuse de supprimer une catégorie non vide
+    category_id = ch_ids[0]
+    child_ids   = ch_ids[1:]
+
+    for ch_id in child_ids:
         try:
             ch = guild.get_channel(ch_id)
             if ch:
                 await ch.delete()
         except Exception:
             pass
+
+    # Supprimer la catégorie en dernier
+    try:
+        cat = guild.get_channel(category_id)
+        if cat:
+            await cat.delete()
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────
 #  LEADERBOARD AUTO
@@ -4125,6 +4230,526 @@ async def update_shop_channel_embed(guild: discord.Guild = None):
         print(f"[SHOP] Erreur update embed: {e}")
 
 
+# ─────────────────────────────────────────────
+#  COMMUNITY — Forums LFP / LFT
+# ─────────────────────────────────────────────
+
+class LFPModal(discord.ui.Modal, title="🔍 Cherche joueurs (LFP)"):
+    rang = discord.ui.TextInput(
+        label="Ton rang actuel",
+        placeholder="Ex: Immortel 2",
+        max_length=50
+    )
+    roles_cherches = discord.ui.TextInput(
+        label="Rôles recherchés",
+        placeholder="Ex: Duelliste, Initiateur",
+        max_length=100
+    )
+    description = discord.ui.TextInput(
+        label="Description du projet / équipe",
+        placeholder="Ex: Équipe semi-pro cherche duelliste pour prep tournoi...",
+        style=discord.TextStyle.paragraph,
+        max_length=500
+    )
+    dispos = discord.ui.TextInput(
+        label="Disponibilités",
+        placeholder="Ex: Soirs semaine + week-end",
+        max_length=100
+    )
+    contact = discord.ui.TextInput(
+        label="Comment te contacter ?",
+        placeholder="Ex: DM Discord, répondre ici...",
+        max_length=100,
+        required=False
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title=f"🔍 LFP — {interaction.user.display_name}",
+            color=0x5865F2
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.add_field(name="🏅 Rang", value=self.rang.value, inline=True)
+        embed.add_field(name="🎭 Rôles recherchés", value=self.roles_cherches.value, inline=True)
+        embed.add_field(name="📝 Description", value=self.description.value, inline=False)
+        embed.add_field(name="🕐 Disponibilités", value=self.dispos.value, inline=True)
+        if self.contact.value:
+            embed.add_field(name="📬 Contact", value=self.contact.value, inline=True)
+        embed.set_footer(text=f"Posté par {interaction.user.display_name} • {discord.utils.format_dt(discord.utils.utcnow(), 'd')}")
+
+        # Poster dans le forum LFP
+        forum_id = config_get("lfp_forum_id")
+        if not forum_id:
+            await interaction.response.send_message("❌ Forum LFP introuvable. Lance `/setupcommunity`.", ephemeral=True)
+            return
+        forum = interaction.guild.get_channel(int(forum_id))
+        if not forum:
+            await interaction.response.send_message("❌ Forum LFP introuvable.", ephemeral=True)
+            return
+        thread, _ = await forum.create_thread(
+            name=f"[LFP] {interaction.user.display_name} — {self.rang.value}",
+            embed=embed
+        )
+        await interaction.response.send_message(
+            f"✅ Ton annonce LFP a été postée : {thread.mention}", ephemeral=True
+        )
+
+
+class LFTModal(discord.ui.Modal, title="🎯 Cherche équipe (LFT)"):
+    rang = discord.ui.TextInput(
+        label="Ton rang actuel",
+        placeholder="Ex: Ascendant 3",
+        max_length=50
+    )
+    roles = discord.ui.TextInput(
+        label="Tes rôles / agents",
+        placeholder="Ex: Sentinelle — Cypher / Killjoy",
+        max_length=100
+    )
+    description = discord.ui.TextInput(
+        label="Présentation & ce que tu cherches",
+        placeholder="Ex: Joueur sérieux cherche équipe pour ranked / tournois...",
+        style=discord.TextStyle.paragraph,
+        max_length=500
+    )
+    dispos = discord.ui.TextInput(
+        label="Disponibilités",
+        placeholder="Ex: Lundi, mercredi, week-end",
+        max_length=100
+    )
+    contact = discord.ui.TextInput(
+        label="Comment te contacter ?",
+        placeholder="Ex: DM Discord, répondre ici...",
+        max_length=100,
+        required=False
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title=f"🎯 LFT — {interaction.user.display_name}",
+            color=0xff9900
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.add_field(name="🏅 Rang", value=self.rang.value, inline=True)
+        embed.add_field(name="🎭 Rôles / Agents", value=self.roles.value, inline=True)
+        embed.add_field(name="📝 Présentation", value=self.description.value, inline=False)
+        embed.add_field(name="🕐 Disponibilités", value=self.dispos.value, inline=True)
+        if self.contact.value:
+            embed.add_field(name="📬 Contact", value=self.contact.value, inline=True)
+        embed.set_footer(text=f"Posté par {interaction.user.display_name} • {discord.utils.format_dt(discord.utils.utcnow(), 'd')}")
+
+        forum_id = config_get("lft_forum_id")
+        if not forum_id:
+            await interaction.response.send_message("❌ Forum LFT introuvable. Lance `/setupcommunity`.", ephemeral=True)
+            return
+        forum = interaction.guild.get_channel(int(forum_id))
+        if not forum:
+            await interaction.response.send_message("❌ Forum LFT introuvable.", ephemeral=True)
+            return
+        thread, _ = await forum.create_thread(
+            name=f"[LFT] {interaction.user.display_name} — {self.rang.value}",
+            embed=embed
+        )
+        await interaction.response.send_message(
+            f"✅ Ton annonce LFT a été postée : {thread.mention}", ephemeral=True
+        )
+
+
+class CommunityButtonView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔍 Cherche joueurs (LFP)", style=discord.ButtonStyle.primary, custom_id="community_lfp")
+    async def lfp_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        role_membre = discord.utils.get(interaction.guild.roles, name="Membre")
+        if role_membre and role_membre not in interaction.user.roles:
+            await interaction.response.send_message("❌ Réservé aux membres.", ephemeral=True)
+            return
+        await interaction.response.send_modal(LFPModal())
+
+    @discord.ui.button(label="🎯 Cherche équipe (LFT)", style=discord.ButtonStyle.success, custom_id="community_lft")
+    async def lft_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        role_membre = discord.utils.get(interaction.guild.roles, name="Membre")
+        if role_membre and role_membre not in interaction.user.roles:
+            await interaction.response.send_message("❌ Réservé aux membres.", ephemeral=True)
+            return
+        await interaction.response.send_modal(LFTModal())
+
+
+@tree.command(name="setupcommunity", description="[ADMIN] Créer les forums LFP / LFT avec boutons")
+async def setupcommunity_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    me = guild.me
+
+    role_membre = discord.utils.get(guild.roles, name="Membre")
+    role_admin  = discord.utils.get(guild.roles, name="Admin")
+    everyone    = guild.default_role
+
+    # Permissions forums — membres peuvent voir et créer des threads
+    ow_forum = {
+        everyone:    discord.PermissionOverwrite(view_channel=False),
+        me:          discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                  manage_channels=True, manage_messages=True),
+    }
+    if role_membre:
+        ow_forum[role_membre] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True,
+            read_message_history=True, attach_files=True,
+            embed_links=True, use_application_commands=True
+        )
+    if role_admin:
+        ow_forum[role_admin] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True,
+            manage_channels=True, manage_messages=True,
+            read_message_history=True
+        )
+
+    # Catégorie COMMUNAUTÉ
+    cat = discord.utils.get(guild.categories, name="🤝 COMMUNAUTÉ")
+    if not cat:
+        cat = await guild.create_category("🤝 COMMUNAUTÉ", overwrites={
+            everyone: discord.PermissionOverwrite(view_channel=False),
+            me: discord.PermissionOverwrite(view_channel=True),
+            role_membre: discord.PermissionOverwrite(view_channel=True) if role_membre else discord.PermissionOverwrite(),
+        })
+
+    # Salon texte avec les boutons (point d'entrée)
+    ow_hub = {
+        everyone:    discord.PermissionOverwrite(view_channel=False),
+        me:          discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True),
+    }
+    if role_membre:
+        ow_hub[role_membre] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=False, read_message_history=True,
+            use_application_commands=True
+        )
+    if role_admin:
+        ow_hub[role_admin] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, manage_messages=True
+        )
+
+    ch_hub = discord.utils.get(guild.text_channels, name="🤝︱recruitement")
+    if not ch_hub:
+        ch_hub = await guild.create_text_channel(
+            "🤝︱recruitement", category=cat, overwrites=ow_hub,
+            topic="Cherche joueurs ou une équipe ? Utilise les boutons !"
+        )
+
+    # Forums LFP et LFT
+    forum_lfp = discord.utils.get(guild.forums, name="🔍︱lfp-cherche-joueurs")
+    if not forum_lfp:
+        forum_lfp = await guild.create_forum(
+            "🔍︱lfp-cherche-joueurs",
+            category=cat,
+            overwrites=ow_forum,
+            topic="Annonces LFP — tu cherches des joueurs pour ton équipe ou ton projet.",
+            default_auto_archive_duration=10080  # 7 jours
+        )
+    config_set("lfp_forum_id", str(forum_lfp.id))
+
+    forum_lft = discord.utils.get(guild.forums, name="🎯︱lft-cherche-equipe")
+    if not forum_lft:
+        forum_lft = await guild.create_forum(
+            "🎯︱lft-cherche-equipe",
+            category=cat,
+            overwrites=ow_forum,
+            topic="Annonces LFT — tu cherches une équipe ou un groupe de joueurs.",
+            default_auto_archive_duration=10080
+        )
+    config_set("lft_forum_id", str(forum_lft.id))
+
+    # Embed dans le hub avec les boutons
+    desc_hub = (
+        "Tu cherches des joueurs pour ton equipe ou tu veux rejoindre un projet ?\n\n"
+        "**\U0001f50d LFP \u2014 Looking For Players**\n"
+        "Tu as une equipe et tu cherches des joueurs a recruter.\n\n"
+        "**\U0001f3af LFT \u2014 Looking For Team**\n"
+        "Tu es un joueur libre et tu cherches une equipe.\n\n"
+        "Clique sur le bouton correspondant pour poster ton annonce.\n"
+        "Tu pourras ajouter des images directement dans ton post apres creation."
+    )
+    embed_hub = discord.Embed(
+        title="\U0001f91d Recrutement & Communaute",
+        description=desc_hub,
+        color=0x5865F2
+    )
+    embed_hub.set_footer(text="Réservé aux membres • Annonces archivées après 7 jours d'inactivité")
+
+    # Vérifier si embed déjà posté
+    saved_hub_msg = config_get("community_hub_msg_id")
+    hub_msg = None
+    if saved_hub_msg:
+        try:
+            hub_msg = await ch_hub.fetch_message(int(saved_hub_msg))
+            await hub_msg.edit(embed=embed_hub, view=CommunityButtonView())
+        except Exception:
+            hub_msg = None
+
+    if not hub_msg:
+        hub_msg = await ch_hub.send(embed=embed_hub, view=CommunityButtonView())
+        config_set("community_hub_msg_id", str(hub_msg.id))
+
+    desc_confirm = (
+        f"• {ch_hub.mention} — hub avec boutons\n"
+        f"• {forum_lfp.mention} — forum LFP\n"
+        f"• {forum_lft.mention} — forum LFT\n\n"
+        "Les membres peuvent maintenant poster leurs annonces via les boutons."
+    )
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title="✅ Communauté configurée !",
+            description=desc_confirm,
+            color=0x3ba55d
+        ),
+        ephemeral=True
+    )
+
+
+# ─────────────────────────────────────────────
+#  EVENTS — Salon annonces événements
+# ─────────────────────────────────────────────
+
+# participants en mémoire : { msg_id: [{"id": uid, "name": name}, ...] }
+event_participants: dict[int, list[dict]] = {}
+
+
+class EventModal(discord.ui.Modal, title="Creer un evenement"):
+    titre = discord.ui.TextInput(
+        label="Titre de l evenement",
+        placeholder="Ex: Tournoi 5v5 HUGE Inhouse #3",
+        max_length=80
+    )
+    date_heure = discord.ui.TextInput(
+        label="Date et heure",
+        placeholder="Ex: Samedi 15 mars a 20h00 heure France",
+        max_length=100
+    )
+    format_event = discord.ui.TextInput(
+        label="Format",
+        placeholder="Ex: Tournoi 5v5 double elimination, 8 equipes max",
+        max_length=150
+    )
+    description = discord.ui.TextInput(
+        label="Description",
+        placeholder="Infos, regles, contexte...",
+        style=discord.TextStyle.paragraph,
+        max_length=600
+    )
+    recompenses = discord.ui.TextInput(
+        label="Prix / Recompenses + lien inscription (optionnel)",
+        placeholder="Ex: 1er : 500 pts boutique | Inscription : discord.gg/xxx",
+        max_length=250,
+        required=False
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        events_ch_id = config_get("events_channel_id")
+        if not events_ch_id:
+            await interaction.response.send_message("Salon events introuvable. Lance /setupevents.", ephemeral=True)
+            return
+        events_ch = interaction.guild.get_channel(int(events_ch_id))
+        if not events_ch:
+            await interaction.response.send_message("Salon events introuvable.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title=f"📅 {self.titre.value}", color=0xff4655)
+        embed.add_field(name="🗓️ Date & heure", value=self.date_heure.value, inline=False)
+        embed.add_field(name="🎮 Format", value=self.format_event.value, inline=False)
+        embed.add_field(name="📝 Description", value=self.description.value, inline=False)
+        if self.recompenses.value:
+            embed.add_field(name="🏆 Prix / Infos", value=self.recompenses.value, inline=False)
+        embed.add_field(name="👥 Inscrits (0)", value="Aucun inscrit pour l instant.", inline=False)
+        embed.set_footer(text=f"Organise par {interaction.user.display_name} • Clique sur Je participe pour t inscrire")
+
+        msg = await events_ch.send(embed=embed, view=EventView(msg_id=None))
+        # Mettre à jour la view avec le vrai msg_id pour les updates
+        event_participants[msg.id] = []
+        await msg.edit(view=EventView(msg_id=msg.id))
+
+        await interaction.response.send_message(
+            f"✅ Evenement posté dans {events_ch.mention} !\n💡 Tu peux completer avec une image en postant dans ce salon.",
+            ephemeral=True
+        )
+
+
+def build_event_embed(original_embed: discord.Embed, participants: list) -> discord.Embed:
+    """Reconstruit l embed avec la liste des participants mise a jour."""
+    embed = discord.Embed(title=original_embed.title, color=original_embed.color)
+    # Copier tous les champs sauf "Inscrits"
+    for field in original_embed.fields:
+        if field.name.startswith("👥 Inscrits"):
+            continue
+        embed.add_field(name=field.name, value=field.value, inline=field.inline)
+    # Ajouter inscrits à jour
+    if participants:
+        names = ", ".join(p["name"] for p in participants)
+        embed.add_field(name=f"👥 Inscrits ({len(participants)})", value=names, inline=False)
+    else:
+        embed.add_field(name="👥 Inscrits (0)", value="Aucun inscrit pour l instant.", inline=False)
+    if original_embed.footer:
+        embed.set_footer(text=original_embed.footer.text)
+    if original_embed.thumbnail:
+        embed.set_thumbnail(url=original_embed.thumbnail.url)
+    return embed
+
+
+class EventView(discord.ui.View):
+    def __init__(self, msg_id: int = None):
+        super().__init__(timeout=None)
+        self.msg_id = msg_id
+
+    @discord.ui.button(label="✅ Je participe", style=discord.ButtonStyle.success, custom_id="event_join")
+    async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        msg_id = interaction.message.id
+        if msg_id not in event_participants:
+            event_participants[msg_id] = []
+
+        participants = event_participants[msg_id]
+        uid = str(interaction.user.id)
+        name = interaction.user.display_name
+
+        existing = next((p for p in participants if p["id"] == uid), None)
+        if existing:
+            participants.remove(existing)
+            status = f"↩️ Tu t es desinscrit. ({len(participants)} participants)"
+        else:
+            participants.append({"id": uid, "name": name})
+            status = f"✅ Tu es inscrit ! ({len(participants)} participants)"
+
+        # Mettre à jour l embed
+        new_embed = build_event_embed(interaction.message.embeds[0], participants)
+        await interaction.message.edit(embed=new_embed)
+        await interaction.response.send_message(status, ephemeral=True)
+
+    @discord.ui.button(label="📋 Liste des inscrits", style=discord.ButtonStyle.secondary, custom_id="event_list")
+    async def list_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        participants = event_participants.get(interaction.message.id, [])
+        if not participants:
+            await interaction.response.send_message("Aucun inscrit pour l instant.", ephemeral=True)
+        else:
+            lines = "\n".join(f"{i+1}. {p['name']}" for i, p in enumerate(participants))
+            await interaction.response.send_message(
+                f"**👥 {len(participants)} inscrit(s) :**\n{lines}", ephemeral=True
+            )
+
+
+class EventButtonView(discord.ui.View):
+    """Bouton dans le salon de gestion pour créer un event."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📅 Créer un événement", style=discord.ButtonStyle.primary, custom_id="create_event")
+    async def create_event_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        role_org = discord.utils.get(interaction.guild.roles, name="Organisateur")
+        if role_org and role_org not in interaction.user.roles:
+            await interaction.response.send_message("❌ Réservé au rôle Organisateur.", ephemeral=True)
+            return
+        await interaction.response.send_modal(EventModal())
+
+
+@tree.command(name="setupevents", description="[ADMIN] Créer le salon events avec bouton organisateur")
+async def setupevents_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    me = guild.me
+
+    role_membre     = discord.utils.get(guild.roles, name="Membre")
+    role_admin      = discord.utils.get(guild.roles, name="Admin")
+    role_org        = discord.utils.get(guild.roles, name="Organisateur")
+    everyone        = guild.default_role
+
+    # Catégorie COMMUNAUTÉ (réutilise si existe déjà)
+    cat = discord.utils.get(guild.categories, name="🤝 COMMUNAUTÉ")
+    if not cat:
+        ow_cat = {everyone: discord.PermissionOverwrite(view_channel=False), me: discord.PermissionOverwrite(view_channel=True)}
+        if role_membre:
+            ow_cat[role_membre] = discord.PermissionOverwrite(view_channel=True)
+        cat = await guild.create_category("🤝 COMMUNAUTÉ", overwrites=ow_cat)
+
+    # Salon events (lecture seule pour membres)
+    ow_events = {
+        everyone:  discord.PermissionOverwrite(view_channel=False),
+        me:        discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True),
+    }
+    if role_membre:
+        ow_events[role_membre] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True, add_reactions=True, use_application_commands=True)
+    if role_admin:
+        ow_events[role_admin] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True)
+    if role_org:
+        ow_events[role_org] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
+
+    ch_events = discord.utils.get(guild.text_channels, name="📅︱events")
+    if not ch_events:
+        ch_events = await guild.create_text_channel(
+            "📅︱events", category=cat, overwrites=ow_events,
+            topic="Événements organisés par la communauté HUGE"
+        )
+    config_set("events_channel_id", str(ch_events.id))
+
+    # Salon organisateur (privé — pour créer les events)
+    ow_org = {
+        everyone:  discord.PermissionOverwrite(view_channel=False),
+        me:        discord.PermissionOverwrite(view_channel=True, send_messages=True),
+    }
+    if role_admin:
+        ow_org[role_admin] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    if role_org:
+        ow_org[role_org] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
+
+    ch_org = discord.utils.get(guild.text_channels, name="🛠️︱créer-event")
+    if not ch_org:
+        ch_org = await guild.create_text_channel(
+            "🛠️︱créer-event", category=cat, overwrites=ow_org,
+            topic="Réservé aux organisateurs — crée ton événement ici"
+        )
+
+    # Embed + bouton dans le salon organisateur
+    embed_org = discord.Embed(
+        title="Creer un evenement",
+        description=(
+            "Clique sur le bouton ci-dessous pour creer un evenement.\n\n"
+            "Tu pourras renseigner :\n"
+            "• Titre\n• Date & heure\n• Format\n• Description\n• Prix / Lien inscription\n\n"
+            "L evenement sera poste automatiquement dans le salon events.\n"
+            "Tu pourras ensuite ajouter une image en postant dans ce salon."
+        ),
+        color=0xff4655
+    )
+    embed_org.set_footer(text="Réservé au rôle Organisateur")
+
+    saved_org_msg = config_get("events_org_msg_id")
+    org_msg = None
+    if saved_org_msg:
+        try:
+            org_msg = await ch_org.fetch_message(int(saved_org_msg))
+            await org_msg.edit(embed=embed_org, view=EventButtonView())
+        except Exception:
+            org_msg = None
+    if not org_msg:
+        org_msg = await ch_org.send(embed=embed_org, view=EventButtonView())
+        config_set("events_org_msg_id", str(org_msg.id))
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title="✅ Events configurés !",
+            description=(
+                f"• {ch_events.mention} — annonces publiques (lecture seule)\n"
+                f"• {ch_org.mention} — bouton de création (Organisateur)\n\n"
+                "N oublie pas d assigner le rôle **Organisateur** aux personnes autorisées."
+            ),
+            color=0x3ba55d
+        ),
+        ephemeral=True
+    )
+
+
 @tree.command(name="setupboutique", description="[ADMIN] Creer/mettre a jour le salon boutique")
 async def setupboutique_cmd(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
@@ -4421,6 +5046,403 @@ async def addcosmetic_cmd(
 
     await interaction.response.send_message(
         f"✅ Article **{name}** ajouté à la boutique (ID: `{item_id}`, prix: **{price} pts**).",
+        ephemeral=True
+    )
+
+
+# ─────────────────────────────────────────────
+#  BLACKLIST
+# ─────────────────────────────────────────────
+
+@tree.command(name="blacklist", description="Gérer ta liste noire de coéquipiers")
+@app_commands.describe(
+    action="Ajouter ou retirer quelqu un",
+    user="Le joueur concerné"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Ajouter", value="add"),
+    app_commands.Choice(name="Retirer", value="remove"),
+    app_commands.Choice(name="Voir ma liste", value="list"),
+])
+async def blacklist_cmd(interaction: discord.Interaction, action: str, user: discord.Member = None):
+    uid = str(interaction.user.id)
+    conn = get_db()
+
+    if action == "list":
+        rows = conn.execute(
+            "SELECT blocked_id FROM blacklists WHERE blocker_id=?", (uid,)
+        ).fetchall()
+        conn.close()
+        if not rows:
+            await interaction.response.send_message("Ta liste noire est vide.", ephemeral=True)
+            return
+        lines = []
+        for r in rows:
+            m = interaction.guild.get_member(int(r["blocked_id"]))
+            lines.append(f"• {m.display_name if m else r['blocked_id']}")
+        await interaction.response.send_message(
+            f"**Blacklist ({len(rows)}) :**\n" + "\n".join(lines), ephemeral=True
+        )
+        return
+
+    if not user:
+        conn.close()
+        await interaction.response.send_message("Précise un joueur.", ephemeral=True)
+        return
+
+    if str(user.id) == uid:
+        conn.close()
+        await interaction.response.send_message("Tu ne peux pas te blacklister toi-même.", ephemeral=True)
+        return
+
+    blocked_id = str(user.id)
+
+    if action == "add":
+        existing = conn.execute(
+            "SELECT 1 FROM blacklists WHERE blocker_id=? AND blocked_id=?", (uid, blocked_id)
+        ).fetchone()
+        if existing:
+            conn.close()
+            await interaction.response.send_message(
+                f"**{user.display_name}** est déjà dans ta blacklist.", ephemeral=True
+            )
+            return
+        conn.execute(
+            "INSERT INTO blacklists (blocker_id, blocked_id) VALUES (?, ?)", (uid, blocked_id)
+        )
+        conn.commit()
+        conn.close()
+        await interaction.response.send_message(
+            f"✅ **{user.display_name}** ajouté à ta blacklist.\n"
+            "Le bot essaiera de vous mettre dans des équipes différentes.",
+            ephemeral=True
+        )
+
+    elif action == "remove":
+        result = conn.execute(
+            "DELETE FROM blacklists WHERE blocker_id=? AND blocked_id=?", (uid, blocked_id)
+        )
+        conn.commit()
+        conn.close()
+        if result.rowcount == 0:
+            await interaction.response.send_message(
+                f"**{user.display_name}** n est pas dans ta blacklist.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"✅ **{user.display_name}** retiré de ta blacklist.", ephemeral=True
+            )
+
+
+@tree.command(name="blacklists", description="[ADMIN] Voir toutes les blacklists du serveur")
+async def blacklists_admin_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT blocker_id, blocked_id, created_at FROM blacklists ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        await interaction.response.send_message("Aucune blacklist enregistrée.", ephemeral=True)
+        return
+    lines = []
+    for r in rows:
+        blocker = interaction.guild.get_member(int(r["blocker_id"]))
+        blocked = interaction.guild.get_member(int(r["blocked_id"]))
+        b1 = blocker.display_name if blocker else r["blocker_id"]
+        b2 = blocked.display_name if blocked else r["blocked_id"]
+        lines.append(f"• **{b1}** → {b2}")
+    # Découper si trop long
+    embed = discord.Embed(
+        title=f"Blacklists du serveur ({len(rows)})",
+        description="\n".join(lines[:50]),
+        color=0xff4444
+    )
+    if len(rows) > 50:
+        embed.set_footer(text=f"+{len(rows)-50} autres non affichées")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  BAN / UNBAN
+# ─────────────────────────────────────────────
+
+@tree.command(name="ban", description="[ADMIN] Bannir un joueur des queues temporairement")
+@app_commands.describe(user="Joueur", heures="Durée en heures (défaut: 24)", raison="Raison du ban")
+async def ban_cmd(interaction: discord.Interaction, user: discord.Member, heures: int = 24, raison: str = "Comportement inapproprié"):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO bans (discord_id, reason, banned_by, expires_at) VALUES (?, ?, ?, datetime('now', ?))",
+        (str(user.id), raison, str(interaction.user.id), f"+{heures} hours")
+    )
+    conn.commit()
+    row = conn.execute("SELECT expires_at FROM bans WHERE discord_id=? ORDER BY expires_at DESC LIMIT 1", (str(user.id),)).fetchone()
+    conn.close()
+    await interaction.response.send_message(
+        f"🔨 **{user.display_name}** banni des queues pendant **{heures}h**\nRaison : {raison}\nExpire : `{row['expires_at']} UTC`",
+        ephemeral=True
+    )
+
+
+@tree.command(name="unban", description="[ADMIN] Débannir un joueur des queues")
+@app_commands.describe(user="Joueur à débannir")
+async def unban_cmd(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    conn = get_db()
+    conn.execute("DELETE FROM bans WHERE discord_id=?", (str(user.id),))
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(f"✅ **{user.display_name}** débanni.", ephemeral=True)
+
+
+@tree.command(name="bans", description="[ADMIN] Voir les bans actifs")
+async def bans_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT discord_id, reason, expires_at, banned_by FROM bans WHERE expires_at > datetime('now') ORDER BY expires_at ASC"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        await interaction.response.send_message("✅ Aucun ban actif.", ephemeral=True)
+        return
+    lines = []
+    for r in rows:
+        member = interaction.guild.get_member(int(r["discord_id"]))
+        name = member.display_name if member else f"ID:{r['discord_id']}"
+        by = "AUTO" if r["banned_by"] == "AUTO" else f"<@{r['banned_by']}>"
+        lines.append(f"• **{name}** — expire `{r['expires_at']} UTC` | {r['reason']} (par {by})")
+    embed = discord.Embed(title=f"🔨 Bans actifs ({len(rows)})", description="\n".join(lines), color=0xff4444)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+#  READY CHECK — Confirmation de présence (2 min)
+# ─────────────────────────────────────────────
+
+READY_TIMEOUT = 120
+ready_checks: dict = {}
+
+
+class ReadyCheckView(discord.ui.View):
+    def __init__(self, ready_id: str):
+        super().__init__(timeout=None)
+        self.ready_id = ready_id
+
+    @discord.ui.button(label="✅ Je suis là !", style=discord.ButtonStyle.success, custom_id="ready_confirm")
+    async def ready_yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rc = ready_checks.get(self.ready_id)
+        if not rc:
+            await interaction.response.send_message("Ce ready check a expiré.", ephemeral=True)
+            return
+        uid = str(interaction.user.id)
+        if uid not in {p["id"] for p in rc["players"]}:
+            await interaction.response.send_message("Tu n'es pas dans cette queue.", ephemeral=True)
+            return
+        if uid in rc["confirmed"]:
+            await interaction.response.send_message("Tu as déjà confirmé ta présence !", ephemeral=True)
+            return
+        rc["confirmed"].add(uid)
+        await interaction.response.send_message("✅ Présence confirmée !", ephemeral=True)
+        await _update_ready_embed(interaction.guild, self.ready_id)
+        if len(rc["confirmed"]) >= len(rc["players"]):
+            if rc.get("task"):
+                rc["task"].cancel()
+            ready_checks.pop(self.ready_id, None)
+            await _launch_ready_match(interaction.guild, rc)
+
+
+async def _update_ready_embed(guild, ready_id: str):
+    rc = ready_checks.get(ready_id)
+    if not rc:
+        return
+    confirmed = len(rc["confirmed"])
+    total = len(rc["players"])
+    bars = "🟢" * confirmed + "⬜" * (total - confirmed)
+    embed = discord.Embed(
+        title="🎮 Match trouvé — Confirme ta présence !",
+        description=(
+            f"{bars} **{confirmed}/{total}**\n\n"
+            f"Tu as **{READY_TIMEOUT // 60} minutes** pour cliquer ✅\n"
+            "Les absents seront exclus du match."
+        ),
+        color=0xff4655
+    )
+    try:
+        ch = guild.get_channel(rc["channel_id"])
+        msg = await ch.fetch_message(rc["msg_id"])
+        await msg.edit(embed=embed)
+    except Exception:
+        pass
+
+
+async def _ready_timeout(guild, ready_id: str):
+    await asyncio.sleep(READY_TIMEOUT)
+    rc = ready_checks.pop(ready_id, None)
+    if not rc:
+        return
+    confirmed_ids = rc["confirmed"]
+    absent = [p for p in rc["players"] if p["id"] not in confirmed_ids]
+    ch = guild.get_channel(rc["channel_id"])
+    try:
+        msg = await ch.fetch_message(rc["msg_id"])
+        await msg.edit(view=None)
+    except Exception:
+        pass
+    # Si quelqu un n a pas confirmé → on cancel, les présents retournent en queue
+    if absent:
+        names = ", ".join(p["name"] for p in absent)
+        if ch:
+            msg_txt = f"Match annule - **{names}** n ont pas confirme.\nLes joueurs presents ont ete remis en queue."
+            await ch.send(msg_txt)
+        # Remettre les joueurs confirmés en tête de queue
+        queue_id = rc["queue_id"]
+        present = [p for p in rc["players"] if p["id"] in confirmed_ids]
+        queues[queue_id] = present + queues[queue_id]
+        return
+    # Tout le monde a confirmé (cas où timeout arrive pile en même temps que le dernier clic)
+    await _launch_ready_match(guild, rc)
+
+
+async def _launch_ready_match(guild, rc: dict):
+    players = rc["players"]
+    queue_id = rc["queue_id"]
+    q_info = QUEUES.get(queue_id, list(QUEUES.values())[0])
+    current_size = test_queue_size if test_mode else QUEUE_SIZE
+
+    if len(players) == current_size:
+        team1, team2 = balance_teams(players)
+    else:
+        mid = len(players) // 2
+        team1, team2 = players[:mid], players[mid:]
+
+    match_id = f"match_{int(datetime.now(timezone.utc).timestamp())}"
+    season = get_current_season()
+    active_matches[match_id] = {"team1": team1, "team2": team2, "votes": {}, "channels": [], "map": "Vote en cours...", "queue_id": queue_id}
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO matches (match_id, team1, team2, map, status, season, queue_id) VALUES (?, ?, ?, 'TBD', 'active', ?, ?)",
+        (match_id, json.dumps([p["id"] for p in team1]), json.dumps([p["id"] for p in team2]), season, queue_id)
+    )
+    conn.commit()
+    conn.close()
+
+    ch = guild.get_channel(rc["channel_id"])
+    await _build_match_channels(guild, match_id, team1, team2, q_info, queue_id, ch)
+
+
+# ─────────────────────────────────────────────
+#  FIN DE SAISON — Soft reset + récompenses
+# ─────────────────────────────────────────────
+
+@tree.command(name="findesaison", description="[ADMIN] Clôturer la saison et lancer la suivante")
+@app_commands.describe(confirmer="Tapez 'oui' pour confirmer")
+async def fin_de_saison_cmd(interaction: discord.Interaction, confirmer: str = "non"):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        return
+
+    saison = get_current_season()
+    if confirmer.lower() != "oui":
+        await interaction.response.send_message(
+            f"⚠️ Tu vas clôturer la **Saison {saison}** et lancer la **Saison {saison+1}**.\n"
+            "• Soft reset ELO (50% de l'écart avec 1000 conservé)\n"
+            "• Récompenses points boutique selon rang final\n"
+            "• DM envoyé à tous les joueurs\n\n"
+            f"Pour confirmer : `/findesaison confirmer:oui`",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    new_saison = saison + 1
+
+    SEASON_REWARDS = {
+        "Radiant": 500, "Diamond": 300, "Platinum": 200,
+        "Gold": 150, "Silver": 100, "Bronze": 50, "Iron": 25,
+    }
+
+    conn = get_db()
+    players = conn.execute("SELECT * FROM players").fetchall()
+    rewarded = []
+
+    for p in players:
+        old_elo = p["elo"] or 1000
+        rname, ricon, _ = get_rank(old_elo)
+        reward_pts = SEASON_REWARDS.get(rname, 25)
+        new_elo = max(800, round(1000 + (old_elo - 1000) * 0.5))
+        conn.execute(
+            "UPDATE players SET elo=?, wins=0, losses=0, streak=0, points=COALESCE(points,0)+? WHERE discord_id=?",
+            (new_elo, reward_pts, p["discord_id"])
+        )
+        rewarded.append((p["discord_id"], p["username"] or "?", rname, ricon, old_elo, new_elo, reward_pts))
+
+    # Soft reset player_queue_elo
+    for qr in conn.execute("SELECT * FROM player_queue_elo").fetchall():
+        new_q_elo = max(800, round(1000 + ((qr["elo"] or 1000) - 1000) * 0.5))
+        conn.execute(
+            "UPDATE player_queue_elo SET elo=?, wins=0, losses=0, streak=0, best_streak=0, placement_done=0, season=? WHERE discord_id=? AND queue_id=?",
+            (new_q_elo, new_saison, qr["discord_id"], qr["queue_id"])
+        )
+
+    conn.execute("INSERT INTO seasons (season_id, started_at) VALUES (?, datetime('now'))", (new_saison,))
+    conn.commit()
+    conn.close()
+
+    # Sync rôles + DM récompenses
+    for uid, uname, rname, ricon, old_elo, new_elo, pts in rewarded:
+        member = guild.get_member(int(uid))
+        if not member:
+            continue
+        await sync_rank_role(guild, member, new_elo)
+        embed_dm = discord.Embed(title=f"🏆 Fin de Saison {saison} !", color=0xffd700)
+        embed_dm.add_field(name="Rang final", value=f"{ricon} **{rname}** ({old_elo} ELO)", inline=True)
+        embed_dm.add_field(name="Récompense", value=f"💰 **+{pts} pts boutique**", inline=True)
+        embed_dm.add_field(name="ELO Saison {new_saison}", value=f"**{new_elo}** (soft reset)", inline=True)
+        embed_dm.set_footer(text=f"Bonne chance en Saison {new_saison} !")
+        try:
+            await member.send(embed=embed_dm)
+        except Exception:
+            pass
+
+    # Annonce publique
+    annonce_ch = None
+    for ch in guild.text_channels:
+        if any(x in ch.name.lower() for x in ["général", "general", "annonce"]):
+            annonce_ch = ch
+            break
+    if annonce_ch:
+        top3 = sorted(rewarded, key=lambda x: x[4], reverse=True)[:3]
+        medals = ["🥇", "🥈", "🥉"]
+        top_str = "\n".join(f"{medals[i]} **{p[1]}** — {p[3]} {p[2]} ({p[4]} ELO)" for i, p in enumerate(top3))
+        embed_ann = discord.Embed(
+            title=f"🏁 Saison {saison} terminée !",
+            description=(
+                f"**🏆 Top 3 :**\n{top_str}\n\n"
+                f"La **Saison {new_saison}** commence maintenant.\n"
+                "Tous les joueurs ont reçu leurs récompenses en DM."
+            ),
+            color=0xffd700
+        )
+        await annonce_ch.send(embed=embed_ann)
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title=f"✅ Saison {saison} clôturée !",
+            description=f"**{len(rewarded)}** joueurs reset • Saison **{new_saison}** lancée",
+            color=0x3ba55d
+        ),
         ephemeral=True
     )
 
@@ -5988,6 +7010,10 @@ async def on_ready():
     init_db()
     # Vues statiques persistantes
     bot.add_view(ApplicationButtonView())
+    bot.add_view(CommunityButtonView())
+    bot.add_view(ReadyCheckView(ready_id=""))
+    bot.add_view(EventView())
+    bot.add_view(EventButtonView())
     for qid in QUEUES:
         bot.add_view(SharedQueueView(qid))
 
