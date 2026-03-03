@@ -5,6 +5,7 @@ import sqlite3
 import json
 import random
 import os
+import httpx
 import asyncio
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 HENRIK_API_KEY = os.getenv("HENRIK_API_KEY", "")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 RIOT_REGION = os.getenv("RIOT_REGION", "eu")  # eu, na, ap, kr, latam, br
 GUILD_ID = int(os.getenv("GUILD_ID", 0))
 
@@ -2768,6 +2770,59 @@ async def finalize_match(interaction: discord.Interaction, match_id: str, winner
     except Exception as e:
         print(f"Erreur update personal embeds after match: {e}")
 
+    # ── ANALYSE IA POST-MATCH ─────────────────────────────────────────────
+    async def run_groq_analysis():
+        try:
+            # Chercher le screenshot dans le salon scoreboard
+            scoreboard_stats = None
+            sb_id = match.get("scoreboard_channel")
+            if sb_id and GROQ_API_KEY:
+                sb_ch = guild.get_channel(sb_id)
+                if sb_ch:
+                    async for msg in sb_ch.history(limit=20):
+                        for att in msg.attachments:
+                            if any(att.filename.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
+                                scoreboard_stats = await extract_scoreboard_with_groq(att.url)
+                                break
+                        if scoreboard_stats:
+                            break
+
+            # Récupérer les riot_ids des joueurs pour le mapping
+            conn_r = get_db()
+            for p in match["team1"] + match["team2"]:
+                row = conn_r.execute("SELECT riot_id FROM players WHERE discord_id=?", (p["id"],)).fetchone()
+                if row and row["riot_id"]:
+                    p["riot_id"] = row["riot_id"]
+            conn_r.close()
+
+            # Convertir elo_changes dict en liste pour generate_match_analysis
+            elo_list = [
+                {"id": pid, "old": v["old"], "new": v["new"], "delta": v["new"] - v["old"]}
+                for pid, v in elo_changes.items()
+            ]
+            analysis = await generate_match_analysis(
+                match_id=match_id,
+                team1=match["team1"],
+                team2=match["team2"],
+                winner=winner,
+                score_w=score_winner,
+                score_l=score_loser,
+                map_name=match.get("map", "?"),
+                elo_changes=elo_list,
+                scoreboard_stats=scoreboard_stats
+            )
+            if analysis:
+                embed_ai = discord.Embed(
+                    description=analysis,
+                    color=0x9b59b6
+                )
+                embed_ai.set_author(name="🤖 Analyse post-match")
+                await result_channel.send(embed=embed_ai)
+        except Exception as e:
+            print(f"[GROQ Post-match] Erreur: {e}")
+
+    asyncio.create_task(run_groq_analysis())
+
     # Supprimer les channels après 10 min (laisse le temps pour MVP + reports)
     await result_channel.send(
         embed=discord.Embed(
@@ -5166,7 +5221,101 @@ async def blacklists_admin_cmd(interaction: discord.Interaction):
 
 
 # ─────────────────────────────────────────────
-#  BAN / UNBAN
+#  GROQ — Vision scoreboard + Analyse post-match
+# ─────────────────────────────────────────────
+
+async def extract_scoreboard_with_groq(image_url: str):
+    if not GROQ_API_KEY:
+        return None
+    prompt = (
+        "Tu regardes un scoreboard de fin de match Valorant. "
+        "Extrais les stats de chaque joueur. "
+        "Reponds en JSON pur, sans markdown. "
+        "Format exact: {\"players\": [{\"name\": \"Nom#TAG\", "
+        "\"kills\": 0, \"deaths\": 0, \"assists\": 0, \"team\": 1}]} "
+        "team=1 gagnants team=2 perdants. null si illisible."
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_url}}
+                        ]
+                    }],
+                    "max_tokens": 800,
+                    "temperature": 0.1
+                }
+            )
+        if resp.status_code != 200:
+            print(f"[GROQ Vision] Erreur {resp.status_code}")
+            return None
+        import re
+        raw = resp.json()["choices"][0]["message"]["content"]
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        return json.loads(m.group()) if m else None
+    except Exception as e:
+        print(f"[GROQ Vision] Exception: {e}")
+        return None
+
+async def generate_match_analysis(match_id, team1, team2, winner, score_w, score_l, map_name, elo_changes, scoreboard_stats):
+    if not GROQ_API_KEY:
+        return None
+
+    def fmt_team(players):
+        out = []
+        for p in players:
+            info = next((e for e in elo_changes if e["id"] == p["id"]), None)
+            elo_str = f"ELO {info['old']}->{info['new']} ({info['delta']:+d})" if info else ""
+            kda = ""
+            if scoreboard_stats:
+                for sp in scoreboard_stats.get("players", []):
+                    riot = p.get("riot_id", "")
+                    if riot and sp.get("name", "").lower() in riot.lower():
+                        k, d, a = sp.get("kills"), sp.get("deaths"), sp.get("assists")
+                        if k is not None:
+                            kda = f" KDA:{k}/{d}/{a}"
+            out.append(f"  {p['name']} {elo_str}{kda}")
+        return ", ".join(out)
+
+    winner_team = team1 if winner == 1 else team2
+    loser_team  = team2 if winner == 1 else team1
+    context = f"Map: {map_name} | Score: {score_w}-{score_l} | Gagnants: {fmt_team(winner_team)} | Perdants: {fmt_team(loser_team)}"
+    prompt = (
+        "Tu es commentateur d un serveur Valorant inhouse. "
+        "Fais une analyse post-match courte (5-8 lignes), fun et percutante en francais. "
+        "Mentionne les pseudos, commente les ELO et KDA marquants. "
+        "Humour si score ecrasan ou serre. Utilise des emojis. Pas de preambule.\n\n"
+        + context
+    )
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 300,
+                    "temperature": 0.85
+                }
+            )
+        if resp.status_code != 200:
+            return None
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"[GROQ Analysis] {e}")
+        return None
+
 # ─────────────────────────────────────────────
 
 @tree.command(name="ban", description="[ADMIN] Bannir un joueur des queues temporairement")
