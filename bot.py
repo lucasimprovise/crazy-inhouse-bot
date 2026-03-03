@@ -314,6 +314,7 @@ def init_db():
         "ALTER TABLE player_channels ADD COLUMN notif_enabled INTEGER DEFAULT 1",
         "ALTER TABLE player_channels ADD COLUMN notif_queues TEXT DEFAULT NULL",
         "ALTER TABLE matches ADD COLUMN score_winner INTEGER DEFAULT NULL",
+        "ALTER TABLE matches ADD COLUMN queue_id TEXT DEFAULT NULL",
         "ALTER TABLE matches ADD COLUMN score_loser INTEGER DEFAULT NULL",
     ]
     # Create extra tables if missing
