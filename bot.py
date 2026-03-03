@@ -242,6 +242,18 @@ def init_db():
             notifs_channel  INTEGER,
             history_channel INTEGER
         );
+        CREATE TABLE IF NOT EXISTS player_match_stats (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id  TEXT NOT NULL,
+            match_id    TEXT NOT NULL,
+            kills       INTEGER DEFAULT 0,
+            deaths      INTEGER DEFAULT 0,
+            assists     INTEGER DEFAULT 0,
+            agent       TEXT DEFAULT NULL,
+            won         INTEGER DEFAULT 0,
+            created_at  TEXT DEFAULT (datetime('now')),
+            UNIQUE(discord_id, match_id)
+        );
         CREATE TABLE IF NOT EXISTS bans (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             discord_id  TEXT NOT NULL,
@@ -950,6 +962,24 @@ def balance_teams(players: list[dict]) -> tuple[list, list]:
                     score += 1
         return score
 
+    # KDA bonus/malus — ±10% max sur l ELO, basé sur les 20 derniers matchs
+    conn_kda = get_db()
+    for pid in ids_set:
+        kda_rows = conn_kda.execute(
+            "SELECT kills, deaths, assists FROM player_match_stats "
+            "WHERE discord_id=? ORDER BY created_at DESC LIMIT 20",
+            (pid,)
+        ).fetchall()
+        if kda_rows and len(kda_rows) >= 3:
+            total_k = sum(r["kills"] for r in kda_rows)
+            total_d = sum(r["deaths"] for r in kda_rows)
+            total_a = sum(r["assists"] for r in kda_rows)
+            kda_ratio = (total_k + total_a * 0.5) / max(total_d, 1)
+            # KDA moyen serveur ≈ 1.5, on normalise autour de ça
+            kda_multiplier = 1.0 + max(-0.10, min(0.10, (kda_ratio - 1.5) * 0.04))
+            elos[pid] = round(elos[pid] * kda_multiplier)
+    conn_kda.close()
+
     best_diff = float("inf")
     best_conflict = float("inf")
     best_splits = []
@@ -1176,6 +1206,59 @@ async def update_player_profil(guild: discord.Guild, uid: str):
     embed.add_field(name="MVP", value=f"🌟 {row['mvp_count']}", inline=True)
     if row["riot_id"]:
         embed.add_field(name="Compte Riot", value=f"`{row['riot_id']}`", inline=True)
+
+    # Stats KDA globales
+    conn_kda = get_db()
+    kda_rows = conn_kda.execute(
+        "SELECT kills, deaths, assists, agent, won FROM player_match_stats WHERE discord_id=? ORDER BY created_at DESC LIMIT 50",
+        (uid,)
+    ).fetchall()
+    if kda_rows:
+        total_k = sum(r["kills"] for r in kda_rows)
+        total_d = sum(r["deaths"] for r in kda_rows)
+        total_a = sum(r["assists"] for r in kda_rows)
+        n_games = len(kda_rows)
+        kda_ratio = round((total_k + total_a * 0.5) / max(total_d, 1), 2)
+        avg_k = round(total_k / n_games, 1)
+        avg_d = round(total_d / n_games, 1)
+        avg_a = round(total_a / n_games, 1)
+        embed.add_field(
+            name=f"🎯 KDA ({n_games} matchs trackés)",
+            value=f"**{avg_k}/{avg_d}/{avg_a}** — ratio **{kda_ratio}**",
+            inline=False
+        )
+        # Agent favori + KDA par agent
+        agent_stats = {}
+        for r in kda_rows:
+            ag = r["agent"]
+            if not ag:
+                continue
+            if ag not in agent_stats:
+                agent_stats[ag] = {"k": 0, "d": 0, "a": 0, "n": 0}
+            agent_stats[ag]["k"] += r["kills"]
+            agent_stats[ag]["d"] += r["deaths"]
+            agent_stats[ag]["a"] += r["assists"]
+            agent_stats[ag]["n"] += 1
+        if agent_stats:
+            fav_agent = max(agent_stats, key=lambda x: agent_stats[x]["n"])
+            fav = agent_stats[fav_agent]
+            fav_kda = round((fav["k"] + fav["a"] * 0.5) / max(fav["d"], 1), 2)
+            fav_avg = f"{round(fav['k']/fav['n'],1)}/{round(fav['d']/fav['n'],1)}/{round(fav['a']/fav['n'],1)}"
+            embed.add_field(
+                name=f"⭐ Agent favori",
+                value=f"**{fav_agent}** ({fav['n']} matchs) — {fav_avg} KDA {fav_kda}",
+                inline=False
+            )
+            # Top 3 agents
+            top_agents = sorted(agent_stats.items(), key=lambda x: x[1]["n"], reverse=True)[:3]
+            if len(top_agents) > 1:
+                lines_ag = []
+                for ag, s in top_agents:
+                    r_kda = round((s["k"] + s["a"] * 0.5) / max(s["d"], 1), 2)
+                    lines_ag.append(f"• **{ag}** x{s['n']} — ratio {r_kda}")
+                embed.add_field(name="📊 Agents", value="\n".join(lines_ag), inline=False)
+    conn_kda.close()
+
     embed.set_footer(text=f"Mis à jour — {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC")
 
     # Envoyer le profil mis à jour par DM
@@ -2288,14 +2371,28 @@ async def start_match(interaction: discord.Interaction, queue_id: str = None, gu
         color=0xff4655
     )
     rc_msg = await interaction.channel.send(content=mentions, embed=embed_rc, view=ReadyCheckView(ready_id=ready_id))
+
+    # Bots fictifs (fillqueue) auto-confirmes instantanement
+    auto_confirmed = {p["id"] for p in players if p.get("is_bot")}
+
     ready_checks[ready_id] = {
         "players": players,
-        "confirmed": set(),
+        "confirmed": auto_confirmed,
         "msg_id": rc_msg.id,
         "channel_id": rc_msg.channel.id,
         "queue_id": queue_id,
         "task": None,
     }
+
+    # Si que des bots (test sans humain), lancer direct sans attendre
+    if len(auto_confirmed) >= len(players):
+        await _launch_ready_match(guild, ready_checks.pop(ready_id))
+        return
+
+    # Mettre embed a jour avec bots deja confirmes
+    if auto_confirmed:
+        await _update_ready_embed(guild, ready_id)
+
     task = asyncio.create_task(_ready_timeout(guild, ready_id))
     ready_checks[ready_id]["task"] = task
 
@@ -2309,9 +2406,6 @@ async def _build_match_channels(guild: discord.Guild, match_id: str, team1: list
     elo_t2 = avg_elo(team2)
     chosen_map = active_matches[match_id]["map"]
     season = get_current_season()
-
-    # Stub interaction-like object for the scoreboard channel send
-    interaction = type("FakeInteraction", (), {"channel": src_channel, "guild": guild})()
 
     try:
         coach_role = discord.utils.get(guild.roles, name="Coach")
@@ -2544,9 +2638,9 @@ async def _build_match_channels(guild: discord.Guild, match_id: str, team1: list
             await sc.send(content=f"🎮 **Match lancé !** {mentions}\n{vote_msg}", embed=embed, view=MatchResultView(match_id))
             await sc.send("**🛠️ Contrôles Admin :**", view=AdminMatchView(match_id))
     else:
-        # Fallback sur le channel queue si pas de scoreboard
-        await interaction.channel.send(content=f"🎮 **Match lancé !** {mentions}", embed=embed, view=MatchResultView(match_id))
-        await interaction.channel.send("**🛠️ Contrôles Admin :**", view=AdminMatchView(match_id))
+        # Fallback sur le channel source si pas de scoreboard
+        await src_channel.send(content=f"🎮 **Match lancé !** {mentions}", embed=embed, view=MatchResultView(match_id))
+        await src_channel.send("**🛠️ Contrôles Admin :**", view=AdminMatchView(match_id))
 
     await update_queue_message(guild=guild)
 
@@ -2811,6 +2905,43 @@ async def finalize_match(interaction: discord.Interaction, match_id: str, winner
                 elo_changes=elo_list,
                 scoreboard_stats=scoreboard_stats
             )
+            # Sauvegarder les stats KDA extraites par Vision
+            if scoreboard_stats:
+                conn_s = get_db()
+                all_match_players = match["team1"] + match["team2"]
+                for p in all_match_players:
+                    riot = p.get("riot_id", "")
+                    if not riot:
+                        row_r = conn_s.execute("SELECT riot_id FROM players WHERE discord_id=?", (p["id"],)).fetchone()
+                        riot = row_r["riot_id"] if row_r and row_r["riot_id"] else ""
+                    matched_sp = None
+                    if riot:
+                        for sp in scoreboard_stats.get("players", []):
+                            if sp.get("name", "").lower() in riot.lower() or riot.lower().split("#")[0] in sp.get("name", "").lower():
+                                matched_sp = sp
+                                break
+                    if matched_sp:
+                        team_num = 1 if p in match["team1"] else 2
+                        won_match = 1 if team_num == winner else 0
+                        try:
+                            conn_s.execute(
+                                "INSERT OR IGNORE INTO player_match_stats "
+                                "(discord_id, match_id, kills, deaths, assists, agent, won) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (
+                                    p["id"], match_id,
+                                    matched_sp.get("kills") or 0,
+                                    matched_sp.get("deaths") or 0,
+                                    matched_sp.get("assists") or 0,
+                                    matched_sp.get("agent"),
+                                    won_match
+                                )
+                            )
+                        except Exception as db_err:
+                            print(f"[Stats] DB error: {db_err}")
+                conn_s.commit()
+                conn_s.close()
+
             if analysis:
                 embed_ai = discord.Embed(
                     description=analysis,
@@ -4717,7 +4848,13 @@ async def setupevents_cmd(interaction: discord.Interaction):
 
     role_membre     = discord.utils.get(guild.roles, name="Membre")
     role_admin      = discord.utils.get(guild.roles, name="Admin")
-    role_org        = discord.utils.get(guild.roles, name="Organisateur")
+    role_org = discord.utils.get(guild.roles, name="Organisateur")
+    if not role_org:
+        role_org = await guild.create_role(
+            name="Organisateur",
+            color=discord.Color.orange(),
+            reason="Créé automatiquement par /setupevents"
+        )
     everyone        = guild.default_role
 
     # Catégorie COMMUNAUTÉ (réutilise si existe déjà)
@@ -5230,10 +5367,10 @@ async def extract_scoreboard_with_groq(image_url: str):
     prompt = (
         "Tu regardes un scoreboard de fin de match Valorant. "
         "Extrais les stats de chaque joueur. "
-        "Reponds en JSON pur, sans markdown. "
-        "Format exact: {\"players\": [{\"name\": \"Nom#TAG\", "
+        "Reponds en JSON pur, sans markdown ni backticks. "
+        "Format exact: {\"players\": [{\"name\": \"Nom#TAG\", \"agent\": \"NomAgent\","
         "\"kills\": 0, \"deaths\": 0, \"assists\": 0, \"team\": 1}]} "
-        "team=1 gagnants team=2 perdants. null si illisible."
+        "team=1 gagnants team=2 perdants. agent=null si non visible. null si illisible."
     )
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -5463,6 +5600,15 @@ async def _ready_timeout(guild, ready_id: str):
 
 
 async def _launch_ready_match(guild, rc: dict):
+    # Supprimer le message du ready check
+    try:
+        ch_rc = guild.get_channel(rc["channel_id"])
+        if ch_rc:
+            msg_rc = await ch_rc.fetch_message(rc["msg_id"])
+            await msg_rc.delete()
+    except Exception:
+        pass
+
     players = rc["players"]
     queue_id = rc["queue_id"]
     q_info = QUEUES.get(queue_id, list(QUEUES.values())[0])
