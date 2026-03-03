@@ -2247,21 +2247,10 @@ async def update_queue_message(interaction: discord.Interaction = None, guild: d
     g = guild or (interaction.guild if interaction else None)
     if not g:
         return
-    # Mettre à jour tous les messages de queue enregistrés
-    for qid, ref in queue_message_refs.items():
-        if ref.get("message_id"):
-            try:
-                ch = g.get_channel(ref["channel_id"])
-                if ch:
-                    msg = await ch.fetch_message(ref["message_id"])
-                    await msg.edit(embed=build_queue_embed())
-            except Exception:
-                pass
     try:
         await update_personal_queue_embeds(g)
-    except Exception:
-        pass
-
+    except Exception as e:
+        print(f"[update_queue_message] Erreur: {e}")
 
 # ─────────────────────────────────────────────
 #  MAP VETO
@@ -4006,13 +3995,13 @@ async def queue_cmd(interaction: discord.Interaction):
 @tree.command(name="clearqueue", description="[ADMIN] Vider la queue")
 async def clear_queue(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
+        await interaction.response.send_message(chr(10060)+" Admin seulement.", ephemeral=True)
+        return
     for qid in QUEUES:
         queues[qid].clear()
-    await interaction.response.send_message("✅ Toutes les queues vidées.", ephemeral=True)
+    ready_checks.clear()
+    await interaction.response.send_message(chr(9989)+" Queues et ready checks vides.", ephemeral=True)
     await update_queue_message(interaction)
-    await update_queue_message(interaction)
-
 
 @tree.command(name="setelo", description="[ADMIN] Modifier l'ELO d'un joueur")
 @app_commands.describe(user="Joueur", elo="Nouvel ELO")
@@ -7340,6 +7329,19 @@ async def on_ready():
                     mentionable=False
                 )
                 print(f"✅ Rôle créé : {q_info['role']}")
+
+    # Nettoyer les messages ready check orphelins au restart
+    if real_guild:
+        for ch in real_guild.text_channels:
+            try:
+                async for msg in ch.history(limit=10):
+                    if msg.author == bot.user and msg.embeds:
+                        embed = msg.embeds[0]
+                        if embed.title and "Confirme ta pr" in embed.title:
+                            await msg.delete()
+                            print(f"[Ready] Message orphelin supprime dans #{ch.name}")
+            except Exception:
+                pass
 
     guild = discord.Object(id=GUILD_ID)
     tree.copy_global_to(guild=guild)
