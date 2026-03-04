@@ -2247,10 +2247,21 @@ async def update_queue_message(interaction: discord.Interaction = None, guild: d
     g = guild or (interaction.guild if interaction else None)
     if not g:
         return
+    # Mettre à jour tous les messages de queue enregistrés
+    for qid, ref in queue_message_refs.items():
+        if ref.get("message_id"):
+            try:
+                ch = g.get_channel(ref["channel_id"])
+                if ch:
+                    msg = await ch.fetch_message(ref["message_id"])
+                    await msg.edit(embed=build_queue_embed())
+            except Exception:
+                pass
     try:
         await update_personal_queue_embeds(g)
-    except Exception as e:
-        print(f"[update_queue_message] Erreur: {e}")
+    except Exception:
+        pass
+
 
 # ─────────────────────────────────────────────
 #  MAP VETO
@@ -3995,13 +4006,13 @@ async def queue_cmd(interaction: discord.Interaction):
 @tree.command(name="clearqueue", description="[ADMIN] Vider la queue")
 async def clear_queue(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(chr(10060)+" Admin seulement.", ephemeral=True)
-        return
+        await interaction.response.send_message("❌ Admin seulement.", ephemeral=True)
     for qid in QUEUES:
         queues[qid].clear()
-    ready_checks.clear()
-    await interaction.response.send_message(chr(9989)+" Queues et ready checks vides.", ephemeral=True)
+    await interaction.response.send_message("✅ Toutes les queues vidées.", ephemeral=True)
     await update_queue_message(interaction)
+    await update_queue_message(interaction)
+
 
 @tree.command(name="setelo", description="[ADMIN] Modifier l'ELO d'un joueur")
 @app_commands.describe(user="Joueur", elo="Nouvel ELO")
@@ -5505,7 +5516,7 @@ async def bans_cmd(interaction: discord.Interaction):
 #  READY CHECK — Confirmation de présence (2 min)
 # ─────────────────────────────────────────────
 
-READY_TIMEOUT = 120
+READY_TIMEOUT = 300
 ready_checks: dict = {}
 
 
@@ -5541,9 +5552,20 @@ async def _update_ready_embed(guild, ready_id: str):
     rc = ready_checks.get(ready_id)
     if not rc:
         return
-    confirmed = len(rc["confirmed"])
+    confirmed_ids = rc["confirmed"]
+    confirmed = len(confirmed_ids)
     total = len(rc["players"])
     bars = "🟢" * confirmed + "⬜" * (total - confirmed)
+
+    lines_p = []
+    for p in rc["players"]:
+        name = p["name"]
+        if p["id"] in confirmed_ids:
+            lines_p.append(f"✅ {name}")
+        else:
+            lines_p.append(f"⏳ **{name}**")
+    players_str = "\n".join(lines_p)
+
     embed = discord.Embed(
         title="🎮 Match trouvé — Confirme ta présence !",
         description=(
@@ -5553,6 +5575,7 @@ async def _update_ready_embed(guild, ready_id: str):
         ),
         color=0xff4655
     )
+    embed.add_field(name="Joueurs", value=players_str, inline=False)
     try:
         ch = guild.get_channel(rc["channel_id"])
         msg = await ch.fetch_message(rc["msg_id"])
@@ -5569,24 +5592,36 @@ async def _ready_timeout(guild, ready_id: str):
     confirmed_ids = rc["confirmed"]
     absent = [p for p in rc["players"] if p["id"] not in confirmed_ids]
     ch = guild.get_channel(rc["channel_id"])
+
+    # Supprimer le message du ready check dans tous les cas
     try:
         msg = await ch.fetch_message(rc["msg_id"])
-        await msg.edit(view=None)
+        await msg.delete()
     except Exception:
         pass
-    # Si quelqu un n a pas confirmé → on cancel, les présents retournent en queue
+
     if absent:
         names = ", ".join(p["name"] for p in absent)
         if ch:
-            msg_txt = f"Match annule - **{names}** n ont pas confirme.\nLes joueurs presents ont ete remis en queue."
-            await ch.send(msg_txt)
-        # Remettre les joueurs confirmés en tête de queue
+            await ch.send(
+                f"Match annule - **{names}** n'ont pas confirme. "
+                f"Les joueurs presents ont ete remis en queue."
+            )
+        # Cooldown 2 min sur les absents
+        for p in absent:
+            cooldowns[p["id"]] = datetime.now(timezone.utc) + timedelta(minutes=2)
+        # Remettre les presents en tete de queue
         queue_id = rc["queue_id"]
         present = [p for p in rc["players"] if p["id"] in confirmed_ids]
-        queues[queue_id] = present + queues[queue_id]
+        queues[queue_id] = present + list(queues.get(queue_id, []))
+        # Mettre a jour l embed de queue
+        await update_queue_message(guild=guild)
         return
-    # Tout le monde a confirmé (cas où timeout arrive pile en même temps que le dernier clic)
+
+    # Tout le monde a confirme
     await _launch_ready_match(guild, rc)
+
+
 
 
 async def _launch_ready_match(guild, rc: dict):
@@ -7329,19 +7364,6 @@ async def on_ready():
                     mentionable=False
                 )
                 print(f"✅ Rôle créé : {q_info['role']}")
-
-    # Nettoyer les messages ready check orphelins au restart
-    if real_guild:
-        for ch in real_guild.text_channels:
-            try:
-                async for msg in ch.history(limit=10):
-                    if msg.author == bot.user and msg.embeds:
-                        embed = msg.embeds[0]
-                        if embed.title and "Confirme ta pr" in embed.title:
-                            await msg.delete()
-                            print(f"[Ready] Message orphelin supprime dans #{ch.name}")
-            except Exception:
-                pass
 
     guild = discord.Object(id=GUILD_ID)
     tree.copy_global_to(guild=guild)
