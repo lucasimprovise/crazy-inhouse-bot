@@ -4014,6 +4014,36 @@ async def clear_queue(interaction: discord.Interaction):
     await update_queue_message(interaction)
 
 
+
+
+@tree.command(name="unstuck", description="[ADMIN] Debloquer un joueur coince")
+@app_commands.describe(user="Joueur a debloquer")
+async def unstuck_cmd(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admin seulement.", ephemeral=True)
+        return
+    uid = str(user.id)
+    removed_from = []
+    for match_id, match in list(active_matches.items()):
+        if any(p["id"] == uid for p in match.get("team1", []) + match.get("team2", [])):
+            removed_from.append(f"match {match_id[-6:]}")
+    for qid in QUEUES:
+        before = len(queues[qid])
+        queues[qid] = [p for p in queues[qid] if p["id"] != uid]
+        if len(queues[qid]) < before:
+            removed_from.append(f"queue {QUEUES[qid]['name']}")
+    for rid, rc in list(ready_checks.items()):
+        if any(p["id"] == uid for p in rc["players"]):
+            rc["confirmed"].discard(uid)
+            removed_from.append("ready check")
+    cooldowns.pop(uid, None)
+    if removed_from:
+        msg = f"Joueur {user.display_name} debloque - retire de : {', '.join(removed_from)}"
+    else:
+        msg = f"{user.display_name} n'etait bloque nulle part."
+    await interaction.response.send_message(msg, ephemeral=True)
+    await update_queue_message(interaction)
+
 @tree.command(name="setelo", description="[ADMIN] Modifier l'ELO d'un joueur")
 @app_commands.describe(user="Joueur", elo="Nouvel ELO")
 async def set_elo(interaction: discord.Interaction, user: discord.Member, elo: int):
